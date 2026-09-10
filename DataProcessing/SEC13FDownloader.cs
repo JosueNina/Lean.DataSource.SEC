@@ -25,6 +25,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using QuantConnect.Configuration;
 using QuantConnect.Data.Auxiliary;
 using QuantConnect.DataSource;
 using QuantConnect.Interfaces;
@@ -57,9 +58,6 @@ namespace QuantConnect.DataProcessing
         private const string DataSetsPageUrl = "https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets";
         private const string SecBaseUrl = "https://www.sec.gov";
 
-        // The SEC asks for a descriptive User-Agent rather than a key, and rate limits to ten
-        // requests a second.
-        private const string UserAgentHeader = "QuantConnect Dataset Processing (data@quantconnect.com)";
 
         private const int MaxRetries = 5;
 
@@ -120,6 +118,9 @@ namespace QuantConnect.DataProcessing
         private readonly DateTime? _deploymentDate;
 
         private readonly HttpClient _client;
+        private bool _userAgentSet;
+
+        // The SEC rate limits automated readers to ten requests a second.
         private readonly RateGate _rateGate = new(10, TimeSpan.FromSeconds(1));
 
         private readonly IMapFileProvider _mapFileProvider;
@@ -226,7 +227,6 @@ namespace QuantConnect.DataProcessing
             Directory.CreateDirectory(_archiveCacheDirectory);
 
             _client = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
-            _client.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgentHeader);
 
             // Zip, not disk: the security master ships map_files_<yyyyMMdd>.zip, and the disk provider
             // only sees loose csv files, so it would resolve almost nothing without failing.
@@ -1153,8 +1153,12 @@ namespace QuantConnect.DataProcessing
                     factor = steps > 0 ? factor / 1000m : factor * 1000m;
                 }
 
-                // A thousandfold unit slip is common; a millionfold one is a wrong share count rather
-                // than a unit, and scaling it would inflate Apple's 2019 quarters by ten percent.
+                // One thousandfold step either way is a unit slip. A line a thousand times above the
+                // median in the dollar era is almost always a VALUE typed a thousand times too large:
+                // of the 4,740 such lines of the March 2023 quarter whose filer reported the same
+                // security the quarter before, 4,578 held the same shares then and 162 a thousand times
+                // more. A millionfold step is a wrong share count rather than a unit, and scaling it
+                // inflated Apple's 2019 quarters by ten percent, so such a line keeps its filing's factor.
                 if (factor > 1000m || factor < 0.001m)
                 {
                     return filing;
@@ -2285,6 +2289,30 @@ namespace QuantConnect.DataProcessing
                    && ticker.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
         }
 
+        /// <summary>
+        /// Sets the User-Agent the SEC asks automated readers for, from the same config keys the
+        /// reports dataset reads, on the first request: a run that never reaches the network, like
+        /// the unit tests, does not need them.
+        /// </summary>
+        private void RequireUserAgent()
+        {
+            if (_userAgentSet)
+            {
+                return;
+            }
+
+            var companyName = Config.Get("sec-user-agent-company-name");
+            var companyEmail = Config.Get("sec-user-agent-company-email");
+            if (string.IsNullOrEmpty(companyName) || string.IsNullOrEmpty(companyEmail))
+            {
+                throw new ArgumentException("The SEC requires a company name and email to download data using " +
+                    "automation. Set `sec-user-agent-company-name` and `sec-user-agent-company-email` in the config.");
+            }
+
+            _client.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", string.Join(" ", companyName, companyEmail));
+            _userAgentSet = true;
+        }
+
         /// <summary>GETs a URL as text, with retry and backoff.</summary>
         private string GetWithRetry(string url)
         {
@@ -2302,6 +2330,7 @@ namespace QuantConnect.DataProcessing
         /// </summary>
         private T WithRetry<T>(string url, Func<T> request)
         {
+            RequireUserAgent();
             for (var attempt = 1; ; attempt++)
             {
                 try

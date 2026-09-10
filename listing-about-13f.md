@@ -117,7 +117,11 @@ Amendments are the one place where lines are not simply summed. Most amendments 
 report, and adding a restatement on top of the report it replaces counted the same position twice:
 for Apple's March 2026 quarter that was 993,574,019 shares, 9.6 percent of the total. An amendment's
 lines therefore count only for a security the manager had not reported for the quarter yet, which is
-what an amendment adding new holdings carries.
+what an amendment adding new holdings carries. The rule only ever adds: a restatement that lowers or
+removes a position leaves the original figure standing, and an amendment adding holdings to a security
+the manager already reported for the quarter is not counted. Against replacing each manager's position
+with its restatement, the difference on the three largest holdings of the March 2026 quarter is under
+0.01 percent.
 
 That count is taken once per manager: a manager that reports the security on several filings, under
 several of the issuer's CUSIPs, or names it for the first time in an amendment counts once for the

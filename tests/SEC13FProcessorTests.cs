@@ -262,8 +262,10 @@ namespace QuantConnect.DataLibrary.Tests
         [Test]
         public void ALineAThousandTimesTheMedianIsBroughtDown()
         {
-            // The same measurement the other way round: three SPY lines of the March 2023 quarter
-            // carried VALUE a thousand times the price, and 16 percent of the total with it.
+            // Three SPY lines of the March 2023 quarter carried VALUE a thousand times the price, and 16
+            // percent of the total with it. It is the VALUE that is off, not the share count: the same
+            // filers reported the same number of shares the quarter before, as 4,578 of the 4,740
+            // comparable lines of that quarter did.
             var filing = new DateTime(2023, 5, 15);
             var quarter = new DateTime(2023, 3, 31);
             var lines = new List<string>();
@@ -279,6 +281,29 @@ namespace QuantConnect.DataLibrary.Tests
             var holdings = ReadInfoTable(lines.ToArray(), submissions.ToArray());
 
             Assert.AreEqual(11 * 40939m, holdings.Values.Single().HoldingValue);
+        }
+
+        [Test]
+        public void ARunWithoutTheSecUserAgentKeysFailsBeforeAnyRequest()
+        {
+            // The SEC asks automated readers to identify themselves, and the reports dataset reads the
+            // name and email from these two keys. Without them the run stops instead of calling out
+            // anonymously.
+            var previousName = Config.Get("sec-user-agent-company-name");
+            var previousEmail = Config.Get("sec-user-agent-company-email");
+            try
+            {
+                Config.Set("sec-user-agent-company-name", string.Empty);
+                Config.Set("sec-user-agent-company-email", string.Empty);
+
+                using var downloader = Downloader();
+                Assert.Throws<ArgumentException>(() => downloader.Run());
+            }
+            finally
+            {
+                Config.Set("sec-user-agent-company-name", previousName);
+                Config.Set("sec-user-agent-company-email", previousEmail);
+            }
         }
 
         [Test]

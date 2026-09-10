@@ -234,6 +234,11 @@ namespace QuantConnect.DataProcessing
         private static string QuarterKey((int Year, int Quarter) quarter)
             => $"{quarter.Year}q{quarter.Quarter}";
 
+        /// <summary>
+        /// The day a data set's tickers are taken to be observed on: its quarter's first day. A ticker
+        /// renamed within that quarter fails the traded-under check in the downloader, so its CUSIP
+        /// stays unresolved until a newer quarter is folded in. Rare, and it never resolves wrongly.
+        /// </summary>
         private static DateTime QuarterStart(int year, int quarter)
             => new(year, quarter * 3 - 2, 1);
 
