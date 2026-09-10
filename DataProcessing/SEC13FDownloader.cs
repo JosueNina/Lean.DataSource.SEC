@@ -38,19 +38,10 @@ using QuantConnect.Util;
 namespace QuantConnect.DataProcessing
 {
     /// <summary>
-    /// Downloads the SEC Form 13F structured data sets and converts them to LEAN's per-security CSV
-    /// format plus one universe file per release date. Selected by "dataset-name": "13f".
-    ///
-    /// The SEC publishes one zip per filing-receipt window: quarterly archives from 2013Q2 to
-    /// 2023Q4, rolling three-month windows since. Each archive carries eight tab separated tables;
-    /// this processor reads SUBMISSION (who filed, when, for which quarter), COVERPAGE and
-    /// SUMMARYPAGE (the confidential treatment flags) and INFOTABLE (the positions themselves).
-    ///
-    /// Output: {destination}/13f/{ticker}.csv and {destination}/13f/universe/{yyyyMMdd}.csv
-    ///
-    /// Modes: full history (no env), incremental (QC_DATAFLEET_DEPLOYMENT_DATE, the production job),
-    /// which reads only the archive whose window covers the deployment date and folds it into the
-    /// published history.
+    /// Converts the SEC Form 13F structured data sets, one zip per filing window, into LEAN's
+    /// per-security files and one universe file per release date. Without
+    /// QC_DATAFLEET_DEPLOYMENT_DATE it rebuilds the whole history; with it, it reads the archive
+    /// covering that date and folds it into the published history.
     /// </summary>
     public class SEC13FDownloader : IDisposable
     {
@@ -76,43 +67,37 @@ namespace QuantConnect.DataProcessing
         // carries no INFOTABLE at all, so it is not a zero position and must not become one.
         private const string NoticeSubmissionTypePrefix = "13F-NT";
 
-        // A 13F-HR/A amends a report the same manager already made for the same quarter, and about
-        // four percent of filings are amendments. Most are RESTATEMENTs, which replace the whole
-        // report, so adding their lines on top of the original counts the manager's positions
-        // twice: on Apple's March 2026 quarter that was 993 million shares, 9.6 percent of the
-        // total. An amendment's lines therefore count only for a security and quarter the manager
-        // had not reported before, which is also exactly what a NEW HOLDINGS amendment carries.
-        // The cost is that a restatement's corrections to a position already reported are not
-        // applied: the original figure stands. See ReadInfoTable and AdmitAmendment.
+        // A 13F-HR/A amends the manager's report for the quarter, and most restate all of it, so an
+        // amendment's lines count only for a security the manager had not reported yet. A
+        // restatement's corrections to a position already counted are not applied; see AdmitAmendment.
         private const string AmendmentSubmissionTypeSuffix = "/A";
 
-        // EDGAR stops accepting same-day filings at 17:30 ET, so everything stamped with a given
-        // FILING_DATE was disseminated by then. Publishing the point at that time keeps it after the
-        // close of the day it became public, which is what the lag in this dataset is worth paying
-        // for: it can never be read earlier than it existed.
+        // EDGAR stops accepting same-day filings at 17:30 ET, so a filing is public by then on its
+        // FILING_DATE and the point can never be read before it existed.
         private static readonly TimeSpan ReleaseTimeOfDay = new(17, 30, 0);
 
         private const string ReleaseFormat = "yyyyMMdd HH:mm";
         private const string PeriodFormat = "yyyyMMdd";
 
-        // The published row is release, period, then the numeric columns and the confidential flag.
-        // Spelled out here because both the writer and the merge that differences the file back to
-        // increments index into it, and they cannot be allowed to disagree.
+        // The published row: release, period, the eight measures and the confidential flag.
         private const int FirstValueColumn = 2;
         private const int ValueColumnCount = 8;
         private const int PublishedColumnCount = FirstValueColumn + ValueColumnCount + 1;
 
-        // How many N-PORT quarters feed the CUSIP to ticker crosswalk. Four covers a year, which is
-        // enough for every security still trading; a name that stopped trading before N-PORT began
-        // in late 2019 is not reachable this way at any depth.
+        // N-PORT quarters folded into the crosswalk: a year reaches every security still trading.
         private const int NPortQuartersToFold = 4;
 
         /// <summary>Days after a quarter end that managers have to file their 13F for it.</summary>
         private const int FilingDeadlineDays = 45;
 
-        // First FILING_DATE reported in whole dollars. Filings before this date report VALUE in
-        // thousands and are scaled up so the published series has one unit end to end. See the
-        // measurement in the aggregation loop.
+        /// <summary>Reports of one security and quarter needed before their median price is a reference.</summary>
+        private const int MinimumReportsForMedianPrice = 3;
+
+        /// <summary>Reports needed before the median can correct a single line on its own.</summary>
+        private const int MinimumReportsForLineCorrection = 10;
+
+        // The SEC rule: VALUE in thousands for filings before this date, whole dollars from it.
+        // DetectValueUnits checks each filing against it.
         private static readonly DateTime ValueInWholeDollarsFrom = new(2023, 1, 1);
 
         private static readonly string[] SecDateFormats = { "dd-MMM-yyyy", "d-MMM-yyyy", "yyyy-MM-dd", "MM/dd/yyyy" };
@@ -132,7 +117,6 @@ namespace QuantConnect.DataProcessing
         private readonly string _destinationDirectory;
         private readonly string _processedDataDirectory;
         private readonly string _archiveCacheDirectory;
-        private readonly string _crosswalkCacheDirectory;
         private readonly DateTime? _deploymentDate;
 
         private readonly HttpClient _client;
@@ -142,17 +126,9 @@ namespace QuantConnect.DataProcessing
         private readonly SecurityDefinitionSymbolResolver _symbolResolver;
 
         /// <summary>
-        /// CUSIP and filing date to security. Every miss walks the entire security database and the
-        /// same CUSIP is asked for on every filing date of every quarter, so this is what makes the
-        /// full pass finish. Misses are cached as a null entry too: they are the lookups that scan
-        /// the list to the end.
-        ///
-        /// The date belongs in the key because the resolution is point in time and tickers get
-        /// reused. Keyed by CUSIP alone, whichever filing date asked first froze the answer for the
-        /// whole run, and a full pass asks from 2013 onwards: Meta's CUSIP resolved through a 2013
-        /// filing, when META named nothing, so 19.3 billion dollars of holdings went elsewhere and
-        /// meta.csv shipped three debt-only rows. Cleared between archives, which keeps the cache
-        /// the size of one window rather than of thirteen years.
+        /// CUSIP and filing date to security, misses included, since each miss scans the whole
+        /// security database. The date is part of the key because resolution is point in time; the
+        /// cache is cleared per archive so it stays the size of one window.
         /// </summary>
         private readonly Dictionary<(string Cusip, DateTime Date), SecurityIdentifier> _resolvedCusips = new();
 
@@ -162,31 +138,21 @@ namespace QuantConnect.DataProcessing
         /// <summary>Map file per security, so the point-in-time ticker costs one lookup per date.</summary>
         private readonly Dictionary<SecurityIdentifier, MapFile> _mapFiles = new();
 
-        /// <summary>
-        /// Accessions already folded in. The archives are keyed by filing-receipt window and do not
-        /// overlap, but a submission counted twice would emit a second row for the same
-        /// (security, period, release) key with different values, which the dedup could not collapse.
-        /// </summary>
+        /// <summary>Accessions already folded in, so a submission can never be counted twice.</summary>
         private readonly HashSet<string> _processedAccessions = new(StringComparer.Ordinal);
 
         /// <summary>
-        /// Increment rows waiting to be staged, flushed once per archive to bound memory. Keyed by
-        /// security and then by (period, release), because several CUSIPs reach the same security:
-        /// a debt CUSIP, a share class the map files fold in, or an issuer that simply carries more
-        /// than one. Their contributions have to be summed here, while the whole day is still in
-        /// memory. Measured on Apple's March 2026 quarter: three of the forty-three release dates
-        /// carry a second CUSIP, worth 152,560 shares. Each row keeps the ticker the security traded
-        /// under that day, which is the file it is finally written to.
+        /// Increments waiting to be staged, flushed per archive. Keyed by security and then by
+        /// (period, release), because several CUSIPs can reach one security and their contributions
+        /// are summed here. Each keeps the ticker of its day, which is the file it lands in.
         /// </summary>
         private readonly Dictionary<string, Dictionary<(DateTime PeriodEnd, DateTime Time), (string Ticker, HoldingsRow Row)>>
             _pendingSecurityRows = new(StringComparer.Ordinal);
 
         /// <summary>
-        /// Where increments wait, one file per security, between the archive that produced them and
-        /// the finalize pass. Keyed by security rather than by ticker because the running total per
-        /// quarter belongs to the security: a quarter still filing when a company is renamed has to
-        /// carry on in the new ticker's file from where the old one stopped, not restart at zero.
-        /// Kept outside the output folder, since everything there is published.
+        /// Where increments wait, one file per security, until the finalize pass. Per security
+        /// because the running total belongs to the security and not to a ticker, and outside the
+        /// output folder because everything there is published.
         /// </summary>
         private readonly string _stagingDirectory =
             Path.Combine(Path.GetTempPath(), "sec-13f-staging", Guid.NewGuid().ToString("N"));
@@ -195,10 +161,8 @@ namespace QuantConnect.DataProcessing
         private readonly HashSet<string> _stagedSecurities = new(StringComparer.Ordinal);
 
         /// <summary>
-        /// Amendments admitted in this archive, as (filer key, filing date). One amendment can name
-        /// several CUSIPs of the same security; the first marks the manager counted and the rest of
-        /// the same filing still have to be let in. Cleared per archive, since a filing date never
-        /// spans two.
+        /// Amendments admitted in this archive, as (filer key, filing date), so one amendment naming
+        /// several CUSIPs of a security is admitted for all of them.
         /// </summary>
         private readonly HashSet<(long FilerKey, int Stamp)> _admittedAmendments = new();
 
@@ -206,17 +170,28 @@ namespace QuantConnect.DataProcessing
         private readonly Dictionary<(string Ticker, DateTime Date), string> _tickerOwners = new();
 
         private long _conflictingTickers;
+        private decimal _conflictingValue;
+        private readonly List<string> _conflictSample = new();
         private long _unchangedGroups;
 
         /// <summary>
-        /// CUSIP to ticker, from the SEC's N-PORT filings. Built on first use rather than at
-        /// construction: the archives may all resolve through the security database, and building
-        /// it downloads a few hundred megabytes per quarter folded in.
+        /// CUSIP to the ticker the SEC's N-PORT filings report for it. Built on first use rather than
+        /// at construction: the archives may all resolve through the security database, and building
+        /// it downloads a few hundred megabytes per quarter folded in. Settable for tests.
         /// </summary>
-        private Dictionary<string, string> _tickerCrosswalk;
+        internal Dictionary<string, SEC13FTickerCrosswalk.Entry> TickerCrosswalk
+        {
+            // Read from the published copy and written with the output, since the raw folder is not
+            // restored between runs and the next run would otherwise rebuild it from 1.8 GB of N-PORT.
+            get => _tickerCrosswalk ??= SEC13FTickerCrosswalk.Load(_processedDataDirectory, _destinationDirectory,
+                NPortQuartersToFold, UrlExists, (url, name) => DownloadFile(url, name, _archiveCacheDirectory));
+            set => _tickerCrosswalk = value;
+        }
 
-        private Dictionary<string, string> TickerCrosswalk => _tickerCrosswalk ??=
-            SEC13FTickerCrosswalk.Load(_client, _crosswalkCacheDirectory, NPortQuartersToFold);
+        private Dictionary<string, SEC13FTickerCrosswalk.Entry> _tickerCrosswalk;
+
+        /// <summary>CUSIP to the security its crosswalk ticker named when the funds reported it.</summary>
+        private readonly Dictionary<string, SecurityIdentifier> _crosswalkSecurities = new(StringComparer.Ordinal);
 
         private long _resolvedByCusip;
         private long _resolvedByIsin;
@@ -243,49 +218,29 @@ namespace QuantConnect.DataProcessing
             _processedDataDirectory = Path.Combine(processedDataDirectory, SEC13FHoldings.ReportFolder);
             _deploymentDate = deploymentDate;
 
-            // Archives are ~100 MB each and the N-PORT crosswalk takes 1.8 GB to rebuild, so both are
-            // kept where the next run can find them. That is the raw folder: the job syncs it to the
-            // archive store after every run, which makes it the only place in the container that
-            // outlives the run. The system temp folder does not, so a cache there is rebuilt from
-            // the SEC on every run. Without a raw folder, which is how the unit tests construct
-            // this, the caches fall back to temp and the processed folder as before.
-            var rawCache = rawDataDirectory == null
-                ? null
-                : Path.Combine(rawDataDirectory, SEC13FHoldings.ReportFolder);
-            _archiveCacheDirectory = rawCache == null
+            // Downloads land in the raw folder, which the job archives after every run but does not
+            // restore before the next, so it only saves work within a run.
+            _archiveCacheDirectory = rawDataDirectory == null
                 ? Path.Combine(Path.GetTempPath(), "sec-13f-archives")
-                : Path.Combine(rawCache, "archives");
-            _crosswalkCacheDirectory = rawCache ?? _processedDataDirectory;
+                : Path.Combine(rawDataDirectory, SEC13FHoldings.ReportFolder, "archives");
             Directory.CreateDirectory(_archiveCacheDirectory);
-            Directory.CreateDirectory(_crosswalkCacheDirectory);
 
             _client = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
             _client.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgentHeader);
 
-            // Zip, not disk. LocalDiskMapFileProvider only enumerates loose .csv files in
-            // equity/usa/map_files, but `lean data download --dataset "US Equity Security Master"`
-            // delivers map_files_<yyyyMMdd>.zip, so on any machine seeded that way the disk
-            // provider sees a couple of dozen securities out of 30,740 and resolves almost
-            // nothing. It fails silently: the run finishes and writes a dataset covering the
-            // handful of tickers that happened to be loose. The zip provider walks back from
-            // yesterday to find the newest dated archive, which is what the download produces.
-            // Point-in-time behaviour is identical either way, since the mapping still comes from
-            // MapFile.GetMappedSymbol(tradingDate).
+            // Zip, not disk: the security master ships map_files_<yyyyMMdd>.zip, and the disk provider
+            // only sees loose csv files, so it would resolve almost nothing without failing.
             _mapFileProvider = new LocalZipMapFileProvider();
             _mapFileProvider.Initialize(new DefaultDataProvider());
 
-            // Reads symbol-properties/security-database.csv from the same LEAN data folder the map
-            // files come from, so the job needs nothing new mounted. The resolver pulls its map file
-            // provider out of the Composer rather than taking one, so it has to be registered first
-            // or the constructor dereferences null.
+            // The resolver takes its map file provider from the Composer, so both are registered first.
             var dataProvider = new DefaultDataProvider();
             Composer.Instance.AddPart<IDataProvider>(dataProvider);
             Composer.Instance.AddPart(_mapFileProvider);
             _symbolResolver = SecurityDefinitionSymbolResolver.GetInstance(dataProvider);
 
-            // security-database.csv is not distributable, and without it the resolver answers null to
-            // every lookup and the run writes an empty dataset while reporting success. Say so at
-            // startup rather than at the end: the processor is expected to run where the file exists.
+            // Without security-database.csv, which is not distributable, the first two resolution
+            // steps answer nothing, so say so at startup rather than let the coverage drop silently.
             var securityDatabasePath = Path.Combine(
                 Globals.GetDataFolderPath("symbol-properties"), "security-database.csv");
             if (!File.Exists(securityDatabasePath))
@@ -295,53 +250,55 @@ namespace QuantConnect.DataProcessing
             }
         }
 
-        /// <summary>Runs the download/convert. Returns true on success.</summary>
-        public bool Run()
+        /// <summary>
+        /// Runs the download/convert. Failures throw rather than return false, so the caller logs
+        /// the actual reason: a guard stopping the run and a network outage are not the same thing.
+        /// </summary>
+        public void Run()
         {
-            try
+            RequireEmptyDestination();
+            RequirePublishedHistoryForIncrementalRun();
+            ReadFilerState();
+
+            var archives = GetArchives();
+            Log.Trace($"SEC13FDownloader.Run(): {archives.Count} archives published, " +
+                      $"{archives[0].Start:yyyy-MM-dd}..{archives[archives.Count - 1].End:yyyy-MM-dd}");
+
+            var selected = SelectArchives(archives);
+            Log.Trace($"SEC13FDownloader.Run(): processing {selected.Count} archive(s): " +
+                      $"{string.Join(", ", selected.Select(x => x.Name))}");
+
+            PruneFilerState(selected);
+
+            foreach (var archive in selected)
             {
-                RequirePublishedHistoryForIncrementalRun();
-                ReadFilerState();
-
-                var archives = GetArchives();
-                Log.Trace($"SEC13FDownloader.Run(): {archives.Count} archives published, " +
-                          $"{archives[0].Start:yyyy-MM-dd}..{archives[archives.Count - 1].End:yyyy-MM-dd}");
-
-                var selected = SelectArchives(archives);
-                Log.Trace($"SEC13FDownloader.Run(): processing {selected.Count} archive(s): " +
-                          $"{string.Join(", ", selected.Select(x => x.Name))}");
-
-                PruneFilerState(selected);
-
-                foreach (var archive in selected)
-                {
-                    ProcessArchive(archive);
-                    FlushPendingRows();
-                }
-
-                FinalizeSecurityFiles();
-                BuildUniverseFiles();
-                WriteFilerState();
-                LogResolutionSummary();
-                return true;
+                ProcessArchive(archive);
+                FlushPendingRows();
             }
-            catch (Exception err)
+
+            FinalizeSecurityFiles();
+            BuildUniverseFiles();
+            WriteFilerState();
+            LogResolutionSummary();
+        }
+
+        /// <summary>
+        /// Stops a run into a destination that already holds files. The job hands it over empty, and
+        /// whatever an earlier run left there would be read into the universe and published again.
+        /// </summary>
+        internal void RequireEmptyDestination()
+        {
+            if (Directory.Exists(_destinationDirectory) && Directory.EnumerateFileSystemEntries(_destinationDirectory).Any())
             {
-                Log.Error(err, "SEC13FDownloader.Run(): failed");
-                return false;
+                throw new InvalidOperationException(
+                    $"SEC13FDownloader.Run(): {_destinationDirectory} is not empty. The destination has to start empty, " +
+                    "or the files an earlier run left there would be published again.");
             }
         }
 
         /// <summary>
-        /// Stops an incremental run that cannot see the published history.
-        ///
-        /// The destination arrives empty on every deployment, so the published copy is the only
-        /// history an incremental run has. When it is missing, wrong or unmounted the merge finds
-        /// nothing to fold in and quietly degrades into a rebuild from scratch: thirteen years of
-        /// per-security history are republished as the single three month window just read, every
-        /// universe file is rebuilt from that window, and the run returns success. No row count
-        /// catches it, because the files come out the right shape. A full pass has no history to
-        /// read and is exempt.
+        /// Stops an incremental run that cannot see the published history: merging into nothing would
+        /// republish thirteen years as one three month window and still report success.
         /// </summary>
         internal void RequirePublishedHistoryForIncrementalRun()
         {
@@ -350,10 +307,8 @@ namespace QuantConnect.DataProcessing
                 return;
             }
 
-            // The crosswalk keeps its cache alongside the security files without being one.
             var published = Directory.Exists(_processedDataDirectory)
-                ? Directory.EnumerateFiles(_processedDataDirectory, "*.csv").Count(file =>
-                    !Path.GetFileName(file).Equals(SEC13FTickerCrosswalk.CacheFileName, StringComparison.OrdinalIgnoreCase))
+                ? Directory.EnumerateFiles(_processedDataDirectory, "*.csv").Count()
                 : 0;
 
             if (published == 0)
@@ -371,13 +326,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Stops an incremental run that cannot see the filers earlier runs counted.
-        ///
-        /// Without the state file every manager in tonight's archive looks new, so a name already
-        /// carrying six thousand holders would be handed six thousand more. Nothing downstream
-        /// notices: the file has the right shape, the row count is unchanged, and only the one
-        /// column is wrong. That is the same silent degradation the published history guard above
-        /// exists for, which is why this fails the run rather than rebuilding what it cannot read.
+        /// Stops an incremental run without the filer state: every manager in tonight's archive would
+        /// look new and Holders would be inflated, with nothing else in the files to show it.
         /// </summary>
         internal void RequireFilerStateForIncrementalRun()
         {
@@ -401,9 +351,8 @@ namespace QuantConnect.DataProcessing
         internal sealed record Archive(string Name, string Url, DateTime Start, DateTime End);
 
         /// <summary>
-        /// Scrapes the data sets page for every published archive, ordered oldest first. The list is
-        /// read rather than held here because a new window arrives every quarter and a hard-coded
-        /// list would silently stop at whatever was published the day it was written.
+        /// Scrapes the data sets page for every published archive, oldest first, so a new window is
+        /// picked up without a code change.
         /// </summary>
         private List<Archive> GetArchives()
         {
@@ -471,11 +420,12 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Picks the archives a run reads: all of them for a full pass, and for an incremental pass
-        /// the one whose window covers the deployment date, falling back to the newest published
-        /// archive when the deployment date runs ahead of what the SEC has released.
+        /// Picks the archives a run reads: all of them for a full pass. An incremental pass reads
+        /// every archive whose window ends on or after the last published release, plus any covering
+        /// the deployment date, so archives the SEC published while the job was down are not skipped.
+        /// The SEC publishes a window after it closes, so the covering one is usually not out yet.
         /// </summary>
-        private List<Archive> SelectArchives(List<Archive> archives)
+        internal List<Archive> SelectArchives(List<Archive> archives)
         {
             if (_deploymentDate == null)
             {
@@ -484,17 +434,37 @@ namespace QuantConnect.DataProcessing
             }
 
             var date = _deploymentDate.Value.Date;
-            var covering = archives.Where(x => x.Start <= date && date <= x.End).ToList();
-            if (covering.Count > 0)
+            var lastPublished = LastPublishedRelease();
+            var selected = archives
+                .Where(x => x.End >= lastPublished || (x.Start <= date && date <= x.End))
+                .ToList();
+
+            if (selected.Count == 0)
             {
-                Log.Trace($"SEC13FDownloader.SelectArchives(): incremental for {date:yyyy-MM-dd}");
-                return covering;
+                selected.Add(archives[archives.Count - 1]);
             }
 
-            var newest = archives[archives.Count - 1];
-            Log.Trace($"SEC13FDownloader.SelectArchives(): incremental for {date:yyyy-MM-dd} falls outside every " +
-                      $"published window, reading the newest archive {newest.Name} instead");
-            return new List<Archive> { newest };
+            Log.Trace($"SEC13FDownloader.SelectArchives(): incremental for {date:yyyy-MM-dd}, last published release " +
+                      $"{lastPublished:yyyy-MM-dd}");
+            return selected;
+        }
+
+        /// <summary>The newest release the published universe carries, or DateTime.MaxValue when there is none.</summary>
+        private DateTime LastPublishedRelease()
+        {
+            var universe = Path.Combine(_processedDataDirectory, "universe");
+            if (!Directory.Exists(universe))
+            {
+                return DateTime.MaxValue;
+            }
+
+            var days = Directory.EnumerateFiles(universe, "*.csv")
+                .Select(file => DateTime.TryParseExact(Path.GetFileNameWithoutExtension(file), DateFormat.EightCharacter,
+                    CultureInfo.InvariantCulture, DateTimeStyles.None, out var day) ? day : (DateTime?)null)
+                .Where(day => day.HasValue)
+                .ToList();
+
+            return days.Count == 0 ? DateTime.MaxValue : days.Max().Value;
         }
 
         /// <summary>
@@ -517,10 +487,8 @@ namespace QuantConnect.DataProcessing
             var submissions = ReadSubmissions(zip, archive);
             if (submissions.Count == 0)
             {
-                // The published archives are keyed by non-overlapping filing-receipt windows, so
-                // each one holds filings no other did. Zero means the table was empty, or held
-                // nothing but notices, or the windows began to overlap. Carrying on would publish a
-                // history with this window missing from it and still report success.
+                // The windows do not overlap, so an archive with no holdings means the layout moved,
+                // and carrying on would publish a history with this window missing.
                 throw new InvalidDataException(
                     $"SEC13FDownloader.ProcessArchive(): {archive.Name} yielded no holdings submissions. " +
                     "An archive that contributes nothing means the upstream layout moved.");
@@ -535,48 +503,62 @@ namespace QuantConnect.DataProcessing
             EmitHoldings(holdings);
         }
 
-        /// <summary>
-        /// Downloads an archive, reusing a copy already on disk. The body is written to a ".part"
-        /// file and moved into place only once the transfer completed, so an interrupted run cannot
-        /// leave a truncated archive that the next run would happily read.
-        /// </summary>
         private string DownloadArchive(Archive archive)
         {
-            var path = Path.Combine(_archiveCacheDirectory, archive.Name);
+            return DownloadFile(archive.Url, archive.Name, _archiveCacheDirectory);
+        }
+
+        /// <summary>
+        /// Downloads a file into a directory, reusing a copy already there. It lands as ".part" first,
+        /// so an interrupted run cannot leave a truncated file for the next one.
+        /// </summary>
+        private string DownloadFile(string url, string name, string directory)
+        {
+            Directory.CreateDirectory(directory);
+            var path = Path.Combine(directory, name);
             if (File.Exists(path))
             {
-                Log.Trace($"SEC13FDownloader.DownloadArchive(): {archive.Name} already on disk");
+                Log.Trace($"SEC13FDownloader.DownloadFile(): {name} already on disk");
                 return path;
             }
 
             var temporaryPath = path + ".part";
-            for (var attempt = 1; attempt <= MaxRetries; attempt++)
+            WithRetry(url, () =>
             {
-                try
-                {
-                    _rateGate.WaitToProceed();
-                    using (var response = _client
-                               .GetAsync(archive.Url, HttpCompletionOption.ResponseHeadersRead)
-                               .GetAwaiter().GetResult())
-                    {
-                        response.EnsureSuccessStatusCode();
-                        using var source = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
-                        using var destination = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write);
-                        source.CopyTo(destination);
-                    }
+                using var response = _client
+                    .GetAsync(url, HttpCompletionOption.ResponseHeadersRead)
+                    .GetAwaiter().GetResult();
+                response.EnsureSuccessStatusCode();
 
-                    File.Move(temporaryPath, path, overwrite: true);
-                    Log.Trace($"SEC13FDownloader.DownloadArchive(): {archive.Name}, {new FileInfo(path).Length} bytes");
-                    return path;
-                }
-                catch (Exception err) when (attempt < MaxRetries && IsWorthRetrying(err))
-                {
-                    Log.Trace($"SEC13FDownloader.DownloadArchive(): {archive.Name} retry {attempt}/{MaxRetries} after: {err.Message}");
-                    Thread.Sleep(TimeSpan.FromSeconds(2 * attempt));
-                }
-            }
+                using var source = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
+                using var destination = new FileStream(temporaryPath, FileMode.Create, FileAccess.Write);
+                source.CopyTo(destination);
+                return true;
+            });
 
-            throw new IOException($"SEC13FDownloader.DownloadArchive(): {archive.Url} failed after {MaxRetries} attempts");
+            File.Move(temporaryPath, path, overwrite: true);
+            Log.Trace($"SEC13FDownloader.DownloadFile(): {name}, {new FileInfo(path).Length} bytes");
+            return path;
+        }
+
+        /// <summary>
+        /// Whether the SEC has published a file: false only on 404. Anything else fails once the
+        /// retries run out, since a 403 taken for "not published" would change the crosswalk quietly.
+        /// </summary>
+        private bool UrlExists(string url)
+        {
+            return WithRetry(url, () =>
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Head, url);
+                using var response = _client.Send(request);
+                if (response.StatusCode == HttpStatusCode.NotFound)
+                {
+                    return false;
+                }
+
+                response.EnsureSuccessStatusCode();
+                return true;
+            });
         }
 
         /// <summary>One filing that carries holdings, keyed in the caller by accession number.</summary>
@@ -631,14 +613,9 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Marks the filings that withheld positions under confidential treatment, which is the
-        /// SUMMARYPAGE ISCONFIDENTIALOMITTED column: the filing is incomplete by design and the
-        /// withheld positions surface in a later release.
-        ///
-        /// COVERPAGE also carries CONFDENIEDEXPIRED, and it is deliberately NOT read here. It
-        /// means the opposite: confidential treatment was denied or has expired, so positions
-        /// previously withheld are being disclosed in this filing. Raising the same flag for both
-        /// would tell an algorithm that the most complete filings are the incomplete ones.
+        /// Marks the filings that withheld positions under confidential treatment (SUMMARYPAGE
+        /// ISCONFIDENTIALOMITTED). COVERPAGE CONFDENIEDEXPIRED is not read: it means the opposite,
+        /// positions withheld before and disclosed in this filing.
         /// </summary>
         private void ApplyConfidentialFlags(ZipArchive zip, Archive archive, Dictionary<string, Submission> submissions)
         {
@@ -694,9 +671,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// The reported lines sharing one (CUSIP, period, release). The measures are the ORIGINAL
-        /// filings only; each amending filer's lines are held apart in Amendments until
-        /// AdmitAmendment knows whether that manager had already reported the security.
+        /// The reported lines sharing one (CUSIP, period, release). The measures hold the original
+        /// filings; amending filers' lines wait in Amendments for AdmitAmendment.
         /// </summary>
         internal sealed class Holding : Measures
         {
@@ -711,19 +687,10 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Every (security, quarter, filer) already counted, so a filer reaches Holders once no
-        /// matter how many filings it makes. Packed into a long rather than kept as a set per
-        /// quarter: the published history holds 57.4 million of these, and one HashSet per
-        /// (security, quarter) pair costs several times what a single flat set does.
-        ///
-        /// Layout, 62 bits: security index in 42..61, period index in 32..41, CIK in 0..31.
-        /// Both indexes are dense and assigned on first sight, so a PERIODOFREPORT that is not a
-        /// quarter end gets its own slot instead of colliding with the quarter it falls in.
-        ///
-        /// The value is the filing date the filer was first counted on, as yyyyMMdd. It is what
-        /// makes re-reading an archive idempotent: the run drops every filer it first counted inside
-        /// the window it is about to read, so recounting reproduces the same increments instead of
-        /// finding all of them already known and publishing zeros. See PruneFilerState.
+        /// Every (security, quarter, filer) already counted, so a filer reaches Holders once. Packed
+        /// into a long (security index in bits 42..61, period index 32..41, CIK 0..31) because the
+        /// history holds 58 million of them. The value is the filing date first counted on, as
+        /// yyyyMMdd, which PruneFilerState uses to make re-reading an archive idempotent.
         /// </summary>
         private readonly Dictionary<long, int> _countedFilers = new();
 
@@ -771,10 +738,7 @@ namespace QuantConnect.DataProcessing
 
         /// <summary>
         /// How many of these filers had not been counted for this security and quarter yet, marking
-        /// them counted as it goes. This is the whole of what Holders means: a manager reaches the
-        /// count once, on the first day it reports the security for that quarter, no matter how many
-        /// filings it makes, how many CUSIPs of the same issuer it names, or whether the filing that
-        /// first names the security is an original or an amendment.
+        /// them counted. A manager reaches Holders once, on the first day it reports the security.
         /// </summary>
         internal int CountNewFilers(SecurityIdentifier security, DateTime period, IEnumerable<int> ciks,
             DateTime filingDate)
@@ -794,15 +758,9 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Forgets every filer first counted on a filing date these archives cover, so reading them
-        /// again recounts from the same starting point.
-        ///
-        /// Without this an incremental run is destructive rather than idempotent. The rolling window
-        /// covers three months and the job reads it every night, so the second night finds every
-        /// filer of that window already counted, publishes an increment of zero for each of its
-        /// days, and the merge lets the fresh reading win: a quarter that carried six thousand
-        /// holders drops to none. The file keeps its shape and only that one column moves, so
-        /// nothing downstream would have caught it.
+        /// Forgets every filer first counted inside these archives' windows, so reading them again
+        /// recounts the same increments. Otherwise the second night would find the whole window
+        /// counted and publish Holders increments of zero over the real ones.
         /// </summary>
         internal void PruneFilerState(List<Archive> archives)
         {
@@ -864,31 +822,20 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// The counted filers, carried next to the security files so the next run can tell a filer
-        /// it has already seen from a new one.
-        ///
-        /// Holders is a distinct count, and a distinct count cannot be recovered from the published
-        /// totals the way the summed measures can: Difference turns a running total back into the
-        /// per day increments it was built from, but nothing in the published file says WHICH
-        /// managers those increments were. An incremental run reads one archive, so without this
-        /// file it cannot know whether tonight's amendment comes from a manager already in the
-        /// count. Zipped because it is the largest thing this dataset ships.
+        /// The counted filers, published next to the security files so an incremental run can tell a
+        /// filer already counted from a new one: a distinct count cannot be rebuilt from the totals.
         /// </summary>
         private const string FilerStateFileName = "filers.zip";
 
         private const string FilerStateEntryName = "filers.csv";
 
-        /// <summary>
-        /// The stamp written on the state entry, fixed so the archive is byte reproducible. Any
-        /// constant would do; this is the date the rule that needs the file was measured.
-        /// </summary>
+        /// <summary>The stamp written on the state entry, fixed so the archive is byte reproducible.</summary>
         private static readonly DateTimeOffset FilerStateTimestamp =
             new(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
         /// <summary>
-        /// Loads the counted filers an earlier run published. A full history run rebuilds every
-        /// count from the archives themselves, so it deliberately starts from an empty state and
-        /// ignores whatever is on the shelf.
+        /// Loads the counted filers an earlier run published. A full run rebuilds every count and
+        /// starts empty.
         /// </summary>
         internal void ReadFilerState()
         {
@@ -934,15 +881,9 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Publishes the counted filers for the next run, sorted by security, quarter and CIK. The
-        /// filers of one security and quarter sit next to each other, which makes the file compress
-        /// to a fraction of its size.
-        ///
-        /// The order comes from the values, not from the packed keys. A key's indexes are assigned
-        /// in the order securities and quarters were first seen, which a full run and an
-        /// incremental one reading this file back do not share: in key order the same 58 million
-        /// filers came out in a different order and the archive changed bytes on a night that
-        /// changed nothing. Each index is swapped for its rank, so the sort stays one over longs.
+        /// Publishes the counted filers sorted by security, quarter and CIK. The order comes from the
+        /// values and not from the packed keys, whose indexes depend on the order things were first
+        /// seen, so a full run and an incremental one write the same bytes.
         /// </summary>
         internal void WriteFilerState()
         {
@@ -968,15 +909,12 @@ namespace QuantConnect.DataProcessing
 
             Array.Sort(keys);
 
-            var temporaryPath = path + ".tmp";
-            using (var file = File.Create(temporaryPath))
-            using (var zip = new ZipArchive(file, ZipArchiveMode.Create))
+            SEC13FFiles.WriteThenMove(path, file =>
             {
+                using var zip = new ZipArchive(file, ZipArchiveMode.Create, leaveOpen: true);
                 var entry = zip.CreateEntry(FilerStateEntryName, CompressionLevel.Optimal);
 
-                // A zip stamps each entry with the moment it was written, so the same content would
-                // hash differently on every run and the delivery archive would look changed when
-                // nothing had. The per-security files are byte reproducible; this one has to be too.
+                // A fixed stamp, or the same filers would hash differently on every run.
                 entry.LastWriteTime = FilerStateTimestamp;
 
                 using var writer = new StreamWriter(entry.Open());
@@ -993,9 +931,7 @@ namespace QuantConnect.DataProcessing
                     writer.Write(_countedFilers[key].ToStringInvariant());
                     writer.Write('\n');
                 }
-            }
-
-            File.Move(temporaryPath, path, overwrite: true);
+            });
             Log.Trace($"SEC13FDownloader.WriteFilerState(): wrote {keys.Length} counted filers to {path}, " +
                       $"{new FileInfo(path).Length / (1024 * 1024)} MB");
         }
@@ -1004,23 +940,22 @@ namespace QuantConnect.DataProcessing
         internal readonly record struct HoldingKey(string Cusip, DateTime Period, DateTime FilingDate);
 
         /// <summary>
-        /// Streams INFOTABLE.tsv and sums every reported line into its group.
-        ///
-        /// The rule is the raw sum: no dedup by INVESTMENTDISCRETION and no dropping of lines that
-        /// name an OTHERMANAGER. It was measured against published institutional ownership
-        /// (MSFT 71.6%, AAPL 63.1%, NVDA 66.0%, inside or just under what providers publish per name); both of the
-        /// obvious dedup rules understate the total by roughly three times.
+        /// Streams INFOTABLE.tsv and sums every reported line into its group, with no dedup by
+        /// discretion or other manager: measured against shares outstanding the raw sum matches
+        /// published ownership, and both dedup rules understate it about three times.
         /// </summary>
         internal Dictionary<HoldingKey, Holding> ReadInfoTable(
             ZipArchive zip, Archive archive, Dictionary<string, Submission> submissions)
         {
             var holdings = new Dictionary<HoldingKey, Holding>();
+            var units = DetectValueUnits(zip, archive, submissions);
 
             foreach (var (columns, fields) in ReadTable(zip, archive, "INFOTABLE.tsv",
                          "ACCESSION_NUMBER", "CUSIP", "VALUE", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL",
                          "VOTING_AUTH_SOLE", "VOTING_AUTH_SHARED"))
             {
-                if (!submissions.TryGetValue(fields[columns["ACCESSION_NUMBER"]], out var submission))
+                var accession = fields[columns["ACCESSION_NUMBER"]];
+                if (!submissions.TryGetValue(accession, out var submission))
                 {
                     // A notice, or a filing an earlier archive already contributed.
                     continue;
@@ -1038,12 +973,9 @@ namespace QuantConnect.DataProcessing
                     holdings[key] = group = new Holding();
                 }
 
-                // Holders counts every manager that reported the security at all, options included,
-                // not only the ones contributing to Shares. An original filing's lines go straight
-                // into the group. An amendment's are held apart per filer, because only the filer
-                // state can say whether this manager already reported the security for the quarter,
-                // possibly in an earlier archive, and a restatement of a position already counted
-                // must not be summed on top of it. See AdmitAmendment.
+                // Holders counts every manager that reported the security, options included. An
+                // amendment's lines are held apart per filer until AdmitAmendment knows whether the
+                // manager had already reported it.
                 Measures holding;
                 if (submission.IsAmendment)
                 {
@@ -1064,27 +996,6 @@ namespace QuantConnect.DataProcessing
                 var putCall = fields[columns["PUTCALL"]].Trim();
                 var amount = ParseDecimal(fields[columns["SSHPRNAMT"]]);
 
-                // VALUE changed unit with the 2023 filings: through 2022 it is reported in
-                // THOUSANDS of dollars, from 2023 in whole dollars. Measured on the real archives
-                // as the median VALUE / SSHPRNAMT of share lines, which is a price per share:
-                //
-                //     NOV-2022 0.0460 · DEC-2022 0.0759   -> thousands
-                //     FEB-2023 39.86  · MAR-2023 36.50    -> whole dollars
-                //     2013q2   0.0373            2023q4 50.46
-                //
-                // Left raw this puts a 1000x step in the middle of the history and breaks every
-                // cross-period comparison, so pre-2023 filings are scaled up and the whole series
-                // is published in whole dollars. The cut is on FILING_DATE, not on the reported
-                // period, because the rule changed for filings made from January 2023 onwards.
-                //
-                // Never sum VALUE without the share filter below: unfiltered it totals $70.1
-                // trillion for a single quarter.
-                var value = ParseDecimal(fields[columns["VALUE"]]);
-                if (submission.FilingDate < ValueInWholeDollarsFrom)
-                {
-                    value *= 1000m;
-                }
-
                 if (putCall.Equals("Call", StringComparison.OrdinalIgnoreCase))
                 {
                     holding.CallShares += amount;
@@ -1097,9 +1008,11 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
+                // On a PRN line SSHPRNAMT is the principal amount, which is what PrincipalValue
+                // publishes; VALUE is the market value of that debt.
                 if (shareType.Equals("PRN", StringComparison.OrdinalIgnoreCase))
                 {
-                    holding.PrincipalValue += value;
+                    holding.PrincipalValue += amount;
                     continue;
                 }
 
@@ -1108,30 +1021,186 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
+                // VALUE only counts under the share filter: unfiltered it totals $70.1 trillion for a
+                // single quarter. In whole dollars, whichever unit the line used.
+                var value = ParseDecimal(fields[columns["VALUE"]]);
                 holding.Shares += amount;
-                holding.HoldingValue += value;
+                holding.HoldingValue += value * units.Factor(accession, cusip, submission, value, amount);
                 holding.VotingSole += ParseDecimal(fields[columns["VOTING_AUTH_SOLE"]]);
                 holding.VotingShared += ParseDecimal(fields[columns["VOTING_AUTH_SHARED"]]);
             }
 
+            Log.Trace($"SEC13FDownloader.ReadInfoTable(): {archive.Name}: {units.CorrectedLines} share lines in " +
+                      "a different unit than the rest of their filing");
             return holdings;
         }
 
         /// <summary>
-        /// Resolves each group to a security and queues its row. Groups that resolve to nothing are
-        /// dropped: they are the foreign issuers and the securities LEAN carries no definition for,
-        /// and the measured coverage of what remains is 88.9% of value.
-        ///
-        /// The row queued here is the INCREMENT, only the filings received that day. The finalize
-        /// pass turns it into the running total per quarter that gets published, because that
-        /// transform also has to reach the increments earlier runs already wrote.
+        /// The factors that turn VALUE into whole dollars. Filers do not all follow the 2023 unit
+        /// change (in Apple's December 2019 quarter 85 lines in dollars made 88 percent of the scaled
+        /// total), and some mix units within one filing, so implied prices are compared with every
+        /// filer's median for the same security: per line where the security has enough reports to
+        /// trust its median, per filing otherwise. A thousand times off means the other unit.
+        /// </summary>
+        internal static ValueUnits DetectValueUnits(ZipArchive zip, Archive archive,
+            Dictionary<string, Submission> submissions)
+        {
+            var keys = new Dictionary<(string Cusip, DateTime Period), int>();
+            var pricesByKey = new List<List<double>>();
+            var linesByFiling = new Dictionary<string, List<(int Key, double Price)>>(StringComparer.Ordinal);
+
+            foreach (var (columns, fields) in ReadTable(zip, archive, "INFOTABLE.tsv",
+                         "ACCESSION_NUMBER", "CUSIP", "VALUE", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL"))
+            {
+                var accession = fields[columns["ACCESSION_NUMBER"]];
+                if (!submissions.TryGetValue(accession, out var submission)
+                    || !fields[columns["SSHPRNAMTTYPE"]].Trim().Equals("SH", StringComparison.OrdinalIgnoreCase)
+                    || fields[columns["PUTCALL"]].Trim().Length > 0)
+                {
+                    continue;
+                }
+
+                var value = ParseDecimal(fields[columns["VALUE"]]);
+                var amount = ParseDecimal(fields[columns["SSHPRNAMT"]]);
+                if (value <= 0m || amount <= 0m)
+                {
+                    continue;
+                }
+
+                var cusip = (fields[columns["CUSIP"]].Trim().ToUpperInvariant(), submission.Period);
+                if (!keys.TryGetValue(cusip, out var key))
+                {
+                    keys[cusip] = key = pricesByKey.Count;
+                    pricesByKey.Add(new List<double>());
+                }
+
+                var price = (double)(value / amount);
+                pricesByKey[key].Add(price);
+
+                if (!linesByFiling.TryGetValue(accession, out var lines))
+                {
+                    linesByFiling[accession] = lines = new List<(int, double)>();
+                }
+
+                lines.Add((key, price));
+            }
+
+            // A median needs a few reports behind it before it says anything about the unit.
+            var medians = pricesByKey
+                .Select(prices => prices.Count >= MinimumReportsForMedianPrice ? Median(prices) : double.NaN)
+                .ToArray();
+
+            var units = new Dictionary<string, decimal>(StringComparer.Ordinal);
+            var againstTheRule = 0;
+            foreach (var (accession, submission) in submissions)
+            {
+                var offsets = linesByFiling.TryGetValue(accession, out var lines)
+                    ? lines.Where(line => !double.IsNaN(medians[line.Key]))
+                        .Select(line => Math.Log10(line.Price / medians[line.Key]))
+                        .ToList()
+                    : new List<double>();
+
+                var thousandsRule = submission.FilingDate < ValueInWholeDollarsFrom;
+                units[accession] = ValueMultiplier(offsets, thousandsRule);
+                if (units[accession] != (thousandsRule ? 1000m : 1m))
+                {
+                    againstTheRule++;
+                }
+            }
+
+            Log.Trace($"SEC13FDownloader.DetectValueUnits(): {archive.Name}: {againstTheRule} of " +
+                      $"{submissions.Count} filings report VALUE in the other unit");
+
+            var references = keys
+                .Where(key => pricesByKey[key.Value].Count >= MinimumReportsForLineCorrection)
+                .ToDictionary(key => key.Key, key => medians[key.Value]);
+            return new ValueUnits(units, references);
+        }
+
+        /// <summary>
+        /// The whole-dollar factor of each share line: its own, measured against the median price of
+        /// its security when that is well reported, or else the one decided for its whole filing.
+        /// </summary>
+        internal sealed class ValueUnits
+        {
+            private readonly Dictionary<string, decimal> _filings;
+            private readonly Dictionary<(string Cusip, DateTime Period), double> _references;
+
+            /// <summary>Share lines whose factor differed from their filing's.</summary>
+            public long CorrectedLines { get; private set; }
+
+            public ValueUnits(Dictionary<string, decimal> filings, Dictionary<(string Cusip, DateTime Period), double> references)
+            {
+                _filings = filings;
+                _references = references;
+            }
+
+            /// <summary>The factor for one share line of VALUE <paramref name="value"/> over <paramref name="amount"/> shares.</summary>
+            public decimal Factor(string accession, string cusip, Submission submission, decimal value, decimal amount)
+            {
+                var filing = _filings[accession];
+                if (value <= 0m || amount <= 0m || !_references.TryGetValue((cusip, submission.Period), out var median))
+                {
+                    return filing;
+                }
+
+                // How many thousandfold steps the line's price sits from the majority's, which reports
+                // in the unit of its filing date.
+                var steps = (int)Math.Clamp(Math.Round(Math.Log10((double)(value / amount) / median) / 3), -2, 2);
+                var factor = submission.FilingDate < ValueInWholeDollarsFrom ? 1000m : 1m;
+                for (var i = 0; i < Math.Abs(steps); i++)
+                {
+                    factor = steps > 0 ? factor / 1000m : factor * 1000m;
+                }
+
+                // A thousandfold unit slip is common; a millionfold one is a wrong share count rather
+                // than a unit, and scaling it would inflate Apple's 2019 quarters by ten percent.
+                if (factor > 1000m || factor < 0.001m)
+                {
+                    return filing;
+                }
+
+                if (factor != filing)
+                {
+                    CorrectedLines++;
+                }
+
+                return factor;
+            }
+        }
+
+        /// <summary>
+        /// Whether a filing's VALUE is multiplied by a thousand. The offsets are log10 of each of its
+        /// implied prices over the median for that security: near zero it uses the majority's unit,
+        /// near +3 it reports dollars where the rule is thousands, near -3 the reverse. With nothing
+        /// to compare against, the rule of the filing date stands.
+        /// </summary>
+        internal static decimal ValueMultiplier(List<double> offsets, bool thousandsRule)
+        {
+            var offset = offsets.Count == 0 ? 0d : Median(offsets);
+            if (thousandsRule)
+            {
+                return offset > 1.5 ? 1m : 1000m;
+            }
+
+            return offset < -1.5 ? 1000m : 1m;
+        }
+
+        private static double Median(List<double> values)
+        {
+            var sorted = values.OrderBy(value => value).ToList();
+            var middle = sorted.Count / 2;
+            return sorted.Count % 2 == 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+        }
+
+        /// <summary>
+        /// Resolves each group to a security and queues its increment, the filings of that day only;
+        /// the finalize pass turns increments into running totals. Groups that resolve to nothing,
+        /// mostly foreign issuers, are dropped.
         /// </summary>
         private void EmitHoldings(Dictionary<HoldingKey, Holding> holdings)
         {
-            // Filing date order, because a filer counts on the first day it reports the security and
-            // the dictionary hands its groups back in whatever order it stored them. Without this
-            // the same archive would credit the count to an arbitrary one of the days a manager
-            // appears on, and two runs over the same archive could disagree.
+            // Filing date order, since a filer counts on the first day it reports the security.
             foreach (var day in holdings.GroupBy(entry => entry.Key.FilingDate).OrderBy(group => group.Key))
             {
                 var resolved = new List<(HoldingKey Key, Holding Holding, SecurityIdentifier Security, string Ticker, int Counted)>();
@@ -1149,13 +1218,18 @@ namespace QuantConnect.DataProcessing
                         continue;
                     }
 
-                    // The row lands in the ticker's file, and everything that reads that file back,
-                    // the universe and LEAN itself, takes it to be the security the map files say
-                    // owns the ticker on that day. When that is some other security the two would be
-                    // mixed in one file, so the group is dropped instead.
-                    if (TickerOwner(ticker, key.FilingDate) != security.ToString())
+                    // Whoever reads the ticker's file takes its rows to belong to the security that
+                    // owns the ticker that day; a group of another security is dropped, not mixed in.
+                    var owner = TickerOwner(ticker, key.FilingDate);
+                    if (owner != security.ToString())
                     {
                         _conflictingTickers++;
+                        _conflictingValue += holding.ReportedValue;
+                        if (_conflictSample.Count < 10)
+                        {
+                            _conflictSample.Add($"{key.Cusip} {key.FilingDate:yyyy-MM-dd} {ticker} is {security}, owner {owner ?? "none"}");
+                        }
+
                         _unresolvedGroups++;
                         _unresolvedValue += holding.ReportedValue;
                         continue;
@@ -1184,9 +1258,7 @@ namespace QuantConnect.DataProcessing
 
                     _resolvedValue += holding.ReportedValue;
 
-                    // A day that brought nothing but restatements of positions already counted
-                    // changes no total, and a data point identical to the one before it is not a
-                    // release.
+                    // A day of nothing but restatements of counted positions changes no total.
                     var values = admitted.ToValues(newFilers);
                     if (!admitted.ConfidentialOmitted && values.All(value => value == 0m))
                     {
@@ -1207,10 +1279,7 @@ namespace QuantConnect.DataProcessing
 
         /// <summary>
         /// Whether an amendment's lines for this security and quarter are added, and whether its
-        /// filer is new to the count. They are added only when the manager had not reported the
-        /// security for the quarter yet, which is what a NEW HOLDINGS amendment carries and what a
-        /// restatement carries for a security its original left out. A restatement of a position
-        /// already counted is not summed on top of it; see AmendmentSubmissionTypeSuffix.
+        /// filer is new: only when the manager had not reported the security for the quarter yet.
         /// </summary>
         internal bool AdmitAmendment(SecurityIdentifier security, DateTime period, int cik, DateTime filingDate,
             out bool newFiler)
@@ -1233,9 +1302,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// The security the map files say trades under a ticker on a date, as its identifier string,
-        /// or null when none does. This is the reading everything downstream applies to a ticker
-        /// file, so writing and reading agree on whose rows a file holds.
+        /// The security trading under a ticker on a date per the map files, or null. It is how the
+        /// universe and LEAN read a ticker file, so writing applies the same test.
         /// </summary>
         private string TickerOwner(string ticker, DateTime date)
         {
@@ -1255,10 +1323,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Resolves a CUSIP to a security, point in time. The SEC ships the nine character CUSIP
-        /// including its check digit and LEAN stores the eight character body, so the check digit
-        /// comes off first. When that misses, the US ISIN is built arithmetically from the same
-        /// CUSIP and tried in turn, which lifts the measured coverage from 76.1% to 88.9% of value.
+        /// Resolves a CUSIP to a security, point in time: by CUSIP, then by the US ISIN built from
+        /// it, then through the N-PORT ticker crosswalk.
         /// </summary>
         private SecurityIdentifier ResolveSecurity(string rawCusip, DateTime tradingDate)
         {
@@ -1284,10 +1350,7 @@ namespace QuantConnect.DataProcessing
                 return null;
             }
 
-            // Step 1, the identifier the SEC actually gives us. LEAN stores the CUSIP without its
-            // check digit, so the ninth character has to come off. Verified in a research notebook
-            // against the real security database: the nine character form resolves 0 of 30 of the
-            // largest holdings, the eight character form resolves 26.
+            // Step 1: LEAN stores the CUSIP without its check digit, so the ninth character comes off.
             var symbol = _symbolResolver.CUSIP(cusip.Substring(0, 8), tradingDate);
             if (symbol != null)
             {
@@ -1298,9 +1361,7 @@ namespace QuantConnect.DataProcessing
             }
             else
             {
-                // Step 2, the US ISIN built arithmetically from the same CUSIP. It reaches issuers
-                // whose CUSIP column is blank in the security database, and in the same notebook it
-                // resolved 28 of those 30 where the CUSIP resolved 26.
+                // Step 2: the US ISIN reaches issuers whose CUSIP is blank in the security database.
                 symbol = _symbolResolver.ISIN(BuildUnitedStatesIsin(cusip), tradingDate);
                 if (symbol != null && firstSighting)
                 {
@@ -1308,14 +1369,11 @@ namespace QuantConnect.DataProcessing
                 }
             }
 
-            // Step 3, the ticker the SEC's own N-PORT filings report for this CUSIP, taken back to
-            // a Symbol through the map files. This is the step that does not need the security
-            // database at all, and it is the one that reaches Alphabet, every other issuer missing
-            // from that file, and the CINS foreign issuers the constructed ISIN cannot represent.
-            // See SEC13FTickerCrosswalk for the measured coverage.
+            // Step 3: the N-PORT crosswalk needs no security database, and reaches Alphabet and the
+            // CINS foreign issuers the constructed ISIN cannot represent.
             if (symbol == null)
             {
-                var identifier = ResolveThroughTicker(cusip, tradingDate);
+                var identifier = ResolveThroughTicker(cusip);
                 if (identifier != null)
                 {
                     if (firstSighting)
@@ -1337,22 +1395,10 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Brings a reported CUSIP to the nine character form, or returns null when it cannot be
-        /// read as one.
-        ///
-        /// Most rows are already nine characters. A minority are shorter, and the full history has
-        /// 12,372 of them, arriving for two different reasons that need opposite repairs:
-        ///
-        ///   "37833100" is Apple's 037833100 with the leading zero eaten, presumably by a
-        ///              spreadsheet that treated the identifier as a number.
-        ///   "46428722" is the iShares Aggregate Bond fund, whose CUSIP is 464287226. Here it is
-        ///              the CHECK DIGIT that is missing, not a leading zero.
-        ///
-        /// Padding the second case with a zero would silently invent a different security, so the
-        /// two are told apart by the check digit itself, which is computable from the body. A short
-        /// value is read as a truncated leading zero only when the padded result checks out;
-        /// otherwise it is read as an eight character body and completed with its own check digit.
-        /// A value holding a character no CUSIP can contain is rejected rather than completed.
+        /// Brings a reported CUSIP to nine characters, or null when it cannot be one. A short value
+        /// has lost either its leading zero ("37833100", Apple) or its check digit ("46428722", an
+        /// iShares fund). Padding the second with a zero would invent another security, so the
+        /// check digit decides which repair applies.
         /// </summary>
         internal static string NormalizeCusip(string cusip)
         {
@@ -1406,9 +1452,7 @@ namespace QuantConnect.DataProcessing
                     value = character switch { '*' => 36, '@' => 37, '#' => 38, _ => -1 };
                     if (value < 0)
                     {
-                        // Not a character a CUSIP can hold. There is no check digit to compute and
-                        // no sentinel value that could not be mistaken for one, so the answer is
-                        // that there is no answer.
+                        // Not a character a CUSIP can hold, so there is no check digit.
                         return null;
                     }
                 }
@@ -1425,28 +1469,36 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Resolves a CUSIP through the N-PORT ticker crosswalk and the map files.
-        ///
-        /// The map file has to be checked before the identifier is built.
-        /// <see cref="SecurityIdentifier.GenerateEquity(string, string, bool, IMapFileProvider, DateTime?)"/>
-        /// falls back to the ticker it was handed and the default date when no map file exists, so
-        /// it never returns null and an unknown ticker would otherwise become a plausible looking
-        /// Symbol with no data behind it.
+        /// Resolves a CUSIP through the N-PORT ticker crosswalk. The ticker is resolved on the day
+        /// the funds reported it, since a ticker names a security only on a date: at a 2021 filing
+        /// META named a Roundhill ETF, not Facebook. The map file is checked first because
+        /// GenerateEquity never returns null for an unknown ticker.
         /// </summary>
-        private SecurityIdentifier ResolveThroughTicker(string cusip, DateTime tradingDate)
+        internal SecurityIdentifier ResolveThroughTicker(string cusip)
         {
-            if (!TickerCrosswalk.TryGetValue(cusip, out var ticker))
+            if (!TickerCrosswalk.TryGetValue(cusip, out var entry))
             {
                 return null;
             }
 
-            var mapFile = _mapFileProvider
-                .Get(new AuxiliaryDataKey(Market.USA, SecurityType.Equity))
-                .ResolveMapFile(ticker, tradingDate);
+            if (!_crosswalkSecurities.TryGetValue(cusip, out var security))
+            {
+                var mapFile = _mapFileProvider
+                    .Get(new AuxiliaryDataKey(Market.USA, SecurityType.Equity))
+                    .ResolveMapFile(entry.Ticker, entry.Observed);
 
-            return mapFile.Any()
-                ? SecurityIdentifier.GenerateEquity(mapFile.FirstDate, mapFile.FirstTicker, Market.USA)
-                : null;
+                // The map file has to carry the ticker on that very date. Barrick reached the
+                // crosswalk as ABX, its Toronto ticker, when ABX named no US security, and the
+                // resolver still returned the company that took ABX months later.
+                var tradedUnderIt = mapFile.Any() && string.Equals(
+                    mapFile.GetMappedSymbol(entry.Observed, null), entry.Ticker, StringComparison.OrdinalIgnoreCase);
+
+                _crosswalkSecurities[cusip] = security = tradedUnderIt
+                    ? SecurityIdentifier.GenerateEquity(mapFile.FirstDate, mapFile.FirstTicker, Market.USA)
+                    : null;
+            }
+
+            return security;
         }
 
         /// <summary>
@@ -1506,19 +1558,21 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// The ticker a security traded under on a date, or null when its map file does not cover the
-        /// date. The map file is held per security, so a rename splits the rows across the files the
-        /// reader will look for, one per ticker.
-        ///
-        /// There is deliberately no fallback to the last known ticker. The map file ends at the
-        /// delisting and managers keep reporting a dead CUSIP for years, so the fallback wrote those
-        /// filings under a ticker that could belong to another company by then: DirecTV, delisted in
-        /// 2015, sat in the May 2026 universe, and gold.csv mixed the holders of two companies. A row
-        /// dated after the delisting is one LEAN would never read anyway.
+        /// The ticker a security traded under on a date, or null when its map file does not cover
+        /// it. No fallback to the last ticker: managers report dead CUSIPs for years, and by then the
+        /// ticker can belong to another company.
         /// </summary>
         internal string ResolveTicker(SecurityIdentifier security, DateTime tradingDate)
         {
-            var ticker = MapFileOf(security)?.GetMappedSymbol(tradingDate, null);
+            // Before its first row a map file answers with its first ticker, for a security that
+            // did not trade yet.
+            var mapFile = MapFileOf(security);
+            if (mapFile == null || tradingDate < mapFile.FirstDate)
+            {
+                return null;
+            }
+
+            var ticker = mapFile.GetMappedSymbol(tradingDate, null);
             return string.IsNullOrEmpty(ticker) ? null : ticker;
         }
 
@@ -1569,9 +1623,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Appends the archive's increments to the staging file of their security. They are appended
-        /// rather than merged here because merging on every archive would re-read and re-sort the
-        /// whole dataset fifty-three times; the merge happens once, in the finalize pass.
+        /// Appends the archive's increments to the staging file of their security; the merge happens
+        /// once, in the finalize pass.
         /// </summary>
         private void FlushPendingRows()
         {
@@ -1598,17 +1651,9 @@ namespace QuantConnect.DataProcessing
 
         /// <summary>
         /// Turns the staged increments into the running total per quarter and writes the ticker
-        /// files, which is what the dataset publishes.
-        ///
-        /// The total is kept per security, not per file: a quarter still filing when a company is
-        /// renamed carries on in the new ticker's file from where the old one stopped. An
-        /// incremental run folds in the published history of every security it touched, from every
-        /// ticker the security ever traded under, and a ticker file it rewrites keeps the rows of
-        /// any other security that held the ticker at another time.
-        ///
-        /// The merge key is (period, release), so a restatement filed later ADDS a row instead of
-        /// overwriting the one that was public at the time. Rows are deterministic, so re-running
-        /// the same day only re-derives lines the set already holds.
+        /// files. The total is kept per security, so a quarter still filing at a rename carries on in
+        /// the new ticker's file. An incremental run folds in the security's published rows from
+        /// every ticker it traded under, and keeps the rows of other securities in a shared file.
         /// </summary>
         private void FinalizeSecurityFiles()
         {
@@ -1656,18 +1701,14 @@ namespace QuantConnect.DataProcessing
                     rows.AddRange(others);
                 }
 
-                // Time order, which is not the order Accumulate() hands rows back in: LEAN's
-                // SubscriptionDataReader drops a point whose timestamp moves backwards, and it does
-                // so silently, so a file sorted any other way loses rows with nothing in the log to
-                // show for it. Ties keep the older quarter first, the order the filings arrived in.
+                // Time order: LEAN's SubscriptionDataReader silently drops a point whose timestamp
+                // moves backwards. Ties keep the older quarter first.
                 File.WriteAllLines(
                     Path.Combine(_destinationDirectory, $"{ticker}.csv"),
                     rows.OrderBy(row => row.Time).ThenBy(row => row.PeriodEnd).Select(FormatRow));
             }
 
-            // What was read off the shelf is stated, not assumed. A merge against an empty history
-            // does not fail, it silently becomes a rebuild from scratch, and the file still comes
-            // out the right shape, so the row count is the only thing that tells the two apart.
+            // The shelf row count is what tells a merge from a silent rebuild, so it is logged.
             Log.Trace($"SEC13FDownloader.FinalizeSecurityFiles(): {_stagedSecurities.Count} securities merged into " +
                       $"{files.Length} ticker files, {shelfRows} of their rows read from {_processedDataDirectory}, " +
                       $"{keptRows} rows of other securities kept unchanged");
@@ -1747,38 +1788,16 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Rebuilds the universe files from the per-security files, which by now hold the finalized
-        /// running totals, then forward-fills the result across business days. Reading the published
-        /// series back rather than emitting universe rows alongside it is what keeps the two views of
-        /// the dataset from drifting apart, and it is how the FINRA processor builds its universe.
-        ///
-        /// The forward-fill is not cosmetic. A universe file has to answer "what is the state of
-        /// the whole cross-section on this date", not "who filed today": a quiet filing day would
-        /// otherwise leave a universe of three names and any ranking built on it would be
-        /// meaningless. This is what FINRA does for short interest.
-        ///
-        /// The carry-forward rule is NOT the FINRA one. FINRA keeps the newest release per
-        /// security, which is safe when reports arrive on schedule. 13F amendments arrive years
-        /// late (the measured worst case is 6,596 days), so newest-release-wins would let a 2018
-        /// amendment landing in 2026 overwrite the 2026 state with stale figures. A row therefore
-        /// only replaces the one held when its PeriodEnd is greater than or equal to the held
-        /// PeriodEnd: equal supersedes, because that is a restatement of the same quarter, and
-        /// older is ignored for carry-forward purposes even though it is the more recent release.
-        /// The row still exists in its own release-date file, so nothing is lost.
-        ///
-        /// Nor is anything carried forever. A quarter leaves once it is older than
-        /// OldestLivePeriod, and a security leaves after the delisting date of its map file:
-        /// without that, a security nobody reports any more sat in every file with its last
-        /// quarter, back to 2013 for some of them.
+        /// Rebuilds the universe from the per-security files and forward-fills it across business
+        /// days, so each file is the whole cross-section on its date rather than who filed that day.
+        /// A row only replaces one of an equal or older quarter, since amendments arrive years late
+        /// and must not overwrite newer figures. A quarter leaves once it is older than
+        /// OldestLivePeriod, and a security after its delisting date.
         /// </summary>
         internal void BuildUniverseFiles()
         {
-            // Release date -> the rows that became public that day. An incremental run reads the
-            // published history as well, or it would forward-fill a single window and drop every
-            // security that has not filed since. This run's copy comes first and wins: for a
-            // ticker it touched, that file already carries the published history folded in, and
-            // the published copy is the stale half of the pair. A full run rebuilds every file, so
-            // whatever the shelf holds is the history being replaced and is not read.
+            // Release date to the rows public that day. An incremental run also reads the published
+            // files, this run's copy of a ticker winning; a full run replaces them and reads only its own.
             var events = new SortedDictionary<DateTime, List<UniverseRow>>();
             var securities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             var unmapped = 0;
@@ -1797,16 +1816,7 @@ namespace QuantConnect.DataProcessing
 
                 foreach (var file in Directory.EnumerateFiles(directory, "*.csv"))
                 {
-                    // The crosswalk keeps its cache in the published folder so a rerun does not
-                    // re-download gigabytes of N-PORT. It sits next to the security files without
-                    // being one.
-                    var name = Path.GetFileName(file);
-                    if (name.Equals(SEC13FTickerCrosswalk.CacheFileName, StringComparison.OrdinalIgnoreCase))
-                    {
-                        continue;
-                    }
-
-                    var ticker = Path.GetFileNameWithoutExtension(name).ToUpperInvariant();
+                    var ticker = Path.GetFileNameWithoutExtension(file).ToUpperInvariant();
                     if (!securities.Add(ticker))
                     {
                         continue;
@@ -1831,16 +1841,8 @@ namespace QuantConnect.DataProcessing
                         var releaseDate = DateTime
                             .ParseExact(csv[0], ReleaseFormat, CultureInfo.InvariantCulture).Date;
 
-                        // Point in time, on the release date, so a security that was renamed later
-                        // still gets the identifier it had when the filing became public.
-                        //
-                        // The map file is checked first, exactly as ResolveThroughTicker does.
-                        // SecurityIdentifier.GenerateEquity never returns null: with no map file it
-                        // falls back to the ticker it was handed and the default date, so an unknown
-                        // ticker becomes a plausible looking Symbol with no data behind it. The
-                        // published folder is walked here too, and it holds securities this run never
-                        // resolved, so the guard cannot be skipped on the grounds that EmitHoldings
-                        // already applied one.
+                        // The owner of the ticker on the release date. The map file is checked first
+                        // because GenerateEquity never returns null for an unknown ticker.
                         var mapFile = _mapFileProvider
                             .Get(new AuxiliaryDataKey(Market.USA, SecurityType.Equity))
                             .ResolveMapFile(ticker, releaseDate);
@@ -1858,10 +1860,7 @@ namespace QuantConnect.DataProcessing
                             events[releaseDate] = rows = new List<UniverseRow>();
                         }
 
-                        // Everything from PeriodEnd on is carried across unchanged, so the universe
-                        // row and the per-security row cannot report different numbers. The three
-                        // fields the forward-fill reads are kept alongside the line, so the row is
-                        // split once here rather than again on every comparison downstream.
+                        // The per-security row is carried unchanged, so the two views cannot disagree.
                         rows.Add(new UniverseRow(
                             security.ToString(),
                             periodEnd,
@@ -1887,23 +1886,10 @@ namespace QuantConnect.DataProcessing
             var universeDirectory = Path.Combine(_destinationDirectory, "universe");
             Directory.CreateDirectory(universeDirectory);
 
-            // Keyed by SecurityIdentifier, not by ticker: the SID is the stable identity across a
-            // rename, and the row already carries the ticker the security traded under on its own
-            // release date.
-            //
-            // Two quarters are carried per security, not one, and this is the important part. A
-            // quarter fills in over roughly fifty days, so on the second of January a security has
-            // a brand new quarter with five managers in it and a finished one with two thousand.
-            // Publishing only the newest would throw the finished quarter away and leave six weeks
-            // of every year where the cross-section ranks by who filed earliest rather than by how
-            // broadly a name is held. Publishing only the finished one would hide the fresh data.
-            //
-            // ExtractAlphaTrueBeats has the same problem with analyst estimates for a fiscal period
-            // that has not reported yet, and its answer is not to choose: it ships every live period
-            // as its own point, each carrying its own FiscalPeriod and its own AnalystEstimatesCount,
-            // and lets the algorithm decide. Holders is our estimate count, so the same applies. The
-            // older quarter is dropped once the newer one overtakes it in Holders, which is the
-            // point where it stops adding anything, so the doubling only lasts through the handover.
+            // Keyed by SecurityIdentifier, the identity that survives a rename. Two quarters are
+            // carried per security: a new quarter fills in over about fifty days, so publishing only
+            // it would rank names by who filed first, and publishing only the finished one would
+            // hide the fresh data. The older leaves once the newer overtakes it in Holders.
             var current = new Dictionary<string, SortedList<DateTime, UniverseRow>>(StringComparer.Ordinal);
             var written = 0;
             var superseded = 0;
@@ -1922,9 +1908,7 @@ namespace QuantConnect.DataProcessing
                     {
                         current.TryGetValue(row.SecurityIdentifier, out var periods);
 
-                        // An amendment for a quarter already retired, or already past its shelf
-                        // life, is not resurrected: it would put a stale cross-section back into the
-                        // current file.
+                        // A late row for a retired or expired quarter is not resurrected.
                         if (row.PeriodEnd < oldestLive || periods?.Count > 0 && row.PeriodEnd < periods.Keys[0])
                         {
                             ignoredAsStale++;
@@ -1973,8 +1957,7 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
-                // Ordered by the keys the two containers already hold, security then quarter, rather
-                // than by comparing whole lines to recover an order that is known.
+                // Security, then quarter.
                 var rows = current
                     .OrderBy(security => security.Key, StringComparer.Ordinal)
                     .SelectMany(security => security.Value.Values.Select(row => row.Line))
@@ -1995,9 +1978,7 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Keeps the newest quarter, and the one before it only while it still holds more managers
-        /// than the newest does. Anything older than that is dropped: once a quarter has been
-        /// overtaken in breadth it adds nothing a consumer would choose.
+        /// Keeps the newest quarter, and the one before it only while it still holds more managers.
         /// </summary>
         private static void RetireOvertakenQuarters(SortedList<DateTime, UniverseRow> periods)
         {
@@ -2017,10 +1998,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// The oldest quarter still live on a day. Managers have 45 days after a quarter end to
-        /// report it, so until the newest finished quarter's deadline passes the one before it is
-        /// still the complete cross-section, and after that it is stale for everyone who files on
-        /// time.
+        /// The oldest quarter still live on a day: the one before the newest finished quarter stays
+        /// live until that quarter's 45 day filing deadline passes.
         /// </summary>
         internal static DateTime OldestLivePeriod(DateTime day)
         {
@@ -2034,11 +2013,7 @@ namespace QuantConnect.DataProcessing
             return new DateTime(day.Year, (day.Month - 1) / 3 * 3 + 1, 1).AddDays(-1);
         }
 
-        /// <summary>
-        /// One universe row on its way to a file: the line itself, plus the security, the reported
-        /// quarter, the Holders count and the delisting date the forward-fill and the retirement
-        /// rule read. They are carried rather than re-parsed, so the source row is split once.
-        /// </summary>
+        /// <summary>One universe line, with the fields the forward-fill reads kept alongside it.</summary>
         private readonly record struct UniverseRow(
             string SecurityIdentifier, DateTime PeriodEnd, decimal Holders, DateTime DelistingDate, string Line);
 
@@ -2053,14 +2028,9 @@ namespace QuantConnect.DataProcessing
 
         /// <summary>
         /// Folds a security's published rows and this run's increments into the running total per
-        /// quarter, each row tagged with the ticker file it lands in, in time order.
-        ///
-        /// The published rows are cumulative, so they are differenced back to the increments they
-        /// were built from before the merge: an increment is the unit that can be unioned, while two
-        /// running totals covering different sets of filings cannot be combined at all. Everything
-        /// is decimal, so the difference is the exact inverse of the sum and a run that reads no new
-        /// filing reproduces the rows it read value for value. The rows of every ticker the security
-        /// traded under are differenced together, which is what carries a quarter across a rename.
+        /// quarter, each row tagged with its ticker file, in time order. The published rows are
+        /// differenced back to increments first, which is exact in decimal, and across every ticker
+        /// the security traded under, which is what carries a quarter across a rename.
         /// </summary>
         internal static List<(string Ticker, HoldingsRow Row)> MergeSecurity(
             IEnumerable<(string Ticker, HoldingsRow Row)> published,
@@ -2141,10 +2111,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Running-sums the increments within each quarter, which is the published shape: every row
-        /// states what had been reported for its quarter as of its own release date. The managers of
-        /// one quarter file across roughly fifty days, so the increment alone answers a question
-        /// nobody asks.
+        /// Running-sums the increments within each quarter: every published row states what had been
+        /// reported for its quarter as of its own release date.
         /// </summary>
         internal static List<HoldingsRow> Accumulate(IEnumerable<HoldingsRow> increments)
         {
@@ -2215,10 +2183,7 @@ namespace QuantConnect.DataProcessing
             return line.Append(',').Append(row.ConfidentialOmitted ? '1' : '0').ToString();
         }
 
-        /// <summary>
-        /// Reports how much of the dataset made it through identity resolution. The unresolved side
-        /// is the foreign issuers and everything LEAN carries no definition for.
-        /// </summary>
+        /// <summary>Reports how much of the dataset made it through identity resolution.</summary>
         private void LogResolutionSummary()
         {
             var totalValue = _resolvedValue + _unresolvedValue;
@@ -2232,7 +2197,8 @@ namespace QuantConnect.DataProcessing
                       $"{_resolvedByIsin} by constructed ISIN, {_resolvedByTicker} by the N-PORT ticker crosswalk, " +
                       $"{_unresolvedCusips.Count} unresolved, {_malformedCusips} malformed");
             Log.Trace($"SEC13FDownloader.LogResolutionSummary(): {_unresolvedGroups} groups dropped, " +
-                      $"{_conflictingTickers} of them because the ticker belonged to another security that day, " +
+                      $"{_conflictingTickers} of them, {(totalValue == 0m ? 0m : 100m * _conflictingValue / totalValue).ToStringInvariant("F2")}% " +
+                      "of reported value, because the ticker belonged to another security that day, " +
                       $"{coverage.ToStringInvariant("F1")}% of reported value covered, " +
                       $"{_unchangedGroups} resolved groups added nothing new and wrote no row");
 
@@ -2241,69 +2207,18 @@ namespace QuantConnect.DataProcessing
                 Log.Trace($"SEC13FDownloader.LogResolutionSummary(): unresolved sample: " +
                           $"{string.Join(", ", _unresolvedCusips.Take(25))}");
             }
+
+            if (_conflictSample.Count > 0)
+            {
+                Log.Trace($"SEC13FDownloader.LogResolutionSummary(): ticker conflict sample: {string.Join("; ", _conflictSample)}");
+            }
         }
 
-        /// <summary>
-        /// Streams one tab separated table out of the archive, yielding the header's column index map
-        /// alongside each row's fields. A missing table or a missing required column throws: either
-        /// means the upstream layout moved, and a run that carried on would publish a dataset with
-        /// silently empty columns.
-        /// </summary>
-        private static IEnumerable<(Dictionary<string, int> columns, string[] fields)> ReadTable(
+        /// <summary>One table of an archive, where a short row means the layout moved and throws.</summary>
+        private static IEnumerable<(Dictionary<string, int> Columns, string[] Fields)> ReadTable(
             ZipArchive zip, Archive archive, string table, params string[] required)
         {
-            var entry = zip.Entries.FirstOrDefault(x =>
-                string.Equals(Path.GetFileName(x.FullName), table, StringComparison.OrdinalIgnoreCase));
-            if (entry == null)
-            {
-                throw new FileNotFoundException(
-                    $"SEC13FDownloader.ReadTable(): {archive.Name} carries no {table}. Entries: " +
-                    $"{string.Join(", ", zip.Entries.Select(x => x.FullName))}");
-            }
-
-            using var stream = entry.Open();
-            using var reader = new StreamReader(stream);
-
-            var header = reader.ReadLine();
-            if (header == null)
-            {
-                throw new InvalidDataException($"SEC13FDownloader.ReadTable(): {archive.Name} {table} is empty");
-            }
-
-            var columns = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            var names = header.Split('\t');
-            for (var i = 0; i < names.Length; i++)
-            {
-                columns[names[i].Trim()] = i;
-            }
-
-            var missing = required.Where(x => !columns.ContainsKey(x)).ToList();
-            if (missing.Count > 0)
-            {
-                throw new InvalidDataException(
-                    $"SEC13FDownloader.ReadTable(): {archive.Name} {table} is missing {string.Join(", ", missing)}. " +
-                    $"Header: {header}");
-            }
-
-            var maximum = required.Max(x => columns[x]);
-            string line;
-            while ((line = reader.ReadLine()) != null)
-            {
-                if (line.Length == 0)
-                {
-                    continue;
-                }
-
-                var fields = line.Split('\t');
-                if (fields.Length <= maximum)
-                {
-                    throw new InvalidDataException(
-                        $"SEC13FDownloader.ReadTable(): {archive.Name} {table} row holds {fields.Length} fields, " +
-                        $"fewer than the {maximum + 1} the required columns need: {line}");
-                }
-
-                yield return (columns, fields);
-            }
+            return SEC13FFiles.ReadTable(zip, archive.Name, table, skipShortRows: false, required);
         }
 
         /// <summary>
@@ -2357,44 +2272,54 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// True when the ticker is a safe file name. Skips warrants, units and preferreds whose
-        /// tickers carry path separators or other invalid characters.
+        /// True when the ticker can name a file LEAN will ask for. Skips path separators and invalid
+        /// file name characters, and the space and '|' a Symbol cannot hold: the map files carry
+        /// "ua.c " for Under Armour's class C, and its file could never be read.
         /// </summary>
-        private static bool IsFileNameSafe(string ticker)
+        internal static bool IsFileNameSafe(string ticker)
         {
             return ticker.IndexOf('/') < 0
                    && ticker.IndexOf('\\') < 0
+                   && ticker.IndexOf('|') < 0
+                   && !ticker.Any(char.IsWhiteSpace)
                    && ticker.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
         }
 
         /// <summary>GETs a URL as text, with retry and backoff.</summary>
         private string GetWithRetry(string url)
         {
-            for (var attempt = 1; attempt <= MaxRetries; attempt++)
+            return WithRetry(url, () =>
+            {
+                using var response = _client.GetAsync(url).GetAwaiter().GetResult();
+                response.EnsureSuccessStatusCode();
+                return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            });
+        }
+
+        /// <summary>
+        /// Sends a request through the rate gate, retrying with a growing backoff whatever
+        /// IsWorthRetrying accepts. The last failure is the one that surfaces.
+        /// </summary>
+        private T WithRetry<T>(string url, Func<T> request)
+        {
+            for (var attempt = 1; ; attempt++)
             {
                 try
                 {
                     _rateGate.WaitToProceed();
-                    using var response = _client.GetAsync(url).GetAwaiter().GetResult();
-                    response.EnsureSuccessStatusCode();
-                    return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                    return request();
                 }
                 catch (Exception err) when (attempt < MaxRetries && IsWorthRetrying(err))
                 {
-                    Log.Trace($"SEC13FDownloader.GetWithRetry(): {url} retry {attempt}/{MaxRetries} after: {err.Message}");
+                    Log.Trace($"SEC13FDownloader.WithRetry(): {url} retry {attempt}/{MaxRetries} after: {err.Message}");
                     Thread.Sleep(TimeSpan.FromSeconds(2 * attempt));
                 }
             }
-
-            throw new HttpRequestException($"SEC13FDownloader.GetWithRetry(): {url} failed after {MaxRetries} attempts");
         }
 
         /// <summary>
-        /// True when a failed request is worth asking again. The SEC answers 403 to a request whose
-        /// User-Agent it does not like and 404 to an archive it has not published, and neither
-        /// changes on the fourth attempt: retrying them only spends twenty seconds of backoff before
-        /// reporting the same failure. Anything without a status is a transport error, which is
-        /// exactly what backoff is for.
+        /// True when a failed request is worth asking again: transport errors, server errors and
+        /// throttling. A 403 or a 404 from the SEC does not change on a retry.
         /// </summary>
         private static bool IsWorthRetrying(Exception error)
         {

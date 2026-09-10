@@ -51,7 +51,7 @@ The following table describes the dataset properties:
 | Property | Value |
 | --- | --- |
 | Start Date | May 2013 |
-| Asset Coverage | 6,880 US Equities |
+| Asset Coverage | 6,616 US Equities |
 | Data Density | Sparse |
 | Resolution | Daily\* |
 | Timezone | America/New_York |
@@ -59,7 +59,7 @@ The following table describes the dataset properties:
 \* Positions are reported quarterly, but the managers of one quarter file across roughly fifty
 different days and several quarters are live at once, so publication is close to continuous rather
 than quarterly. Measured on the processed files over the twelve months to May 2026, a security
-carries a release on a median of 114 days (p10 28, p90 170); a widely held name such as AAPL
+carries a release on a median of 115 days (p10 29, p90 170); a widely held name such as AAPL
 carries one on 234 of the roughly 250 business days.
 
 The history begins on 2013-05-20, the first filing date in the SEC structured data set, whose first
@@ -138,7 +138,7 @@ one before it could not reach:
    through the map files. This step needs no security database at all and it is what reaches the
    foreign domiciled issuers whose identifier is really a CINS, for which a constructed US ISIN is
    wrong by construction. Alphabet is one of them, which is why `GOOGL` appears in the demo
-   algorithms. With this step the chain covers 97.9 percent of reported value on the most recent
+   algorithms. With this step the chain covers 98.2 percent of reported value on the most recent
    window.
 
 The real limit is the third step's own history: N-PORT begins in late 2019, so a security that
@@ -175,7 +175,7 @@ trade against how crowded a name is. Examples include the following strategies:
 | vendorName | U.S. Securities and Exchange Commission |
 | website | https://www.sec.gov |
 | history | May 2013 |
-| reach | 6,880 US Equities |
+| reach | 6,616 US Equities |
 | shortDescription | Institutional ownership per US Equity aggregated from every Form 13F filing, published quarterly by the SEC |
 | priceCTA | Free in Cloud |
 | delivery | cloud only |
@@ -187,7 +187,7 @@ Licensing card:
 ```html
 <p>Free access to SEC Form 13F Institutional Holdings in QuantConnect Cloud for use in backtesting or live trading.</p>
 <ul>
-    <li>Quarterly institutional ownership across 6,880 US Equities, delivered on the filing date</li>
+    <li>Quarterly institutional ownership across 6,616 US Equities, delivered on the filing date</li>
     <li>Holder counts, share and value totals, option and debt lines, and voting authority, per security and as a universe</li>
     <li>Curated, clean data</li>
 </ul>

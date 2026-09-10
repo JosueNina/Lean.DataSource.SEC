@@ -126,19 +126,6 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
-        public void EndTimeIsTheReleaseItself()
-        {
-            // Time and EndTime are the same instant on purpose. The point IS the publication, and
-            // the quarter it describes is carried in PeriodEnd, so there is no offset to model and
-            // no window for look-ahead to hide in. This mirrors EstimizeConsensus, whose EndTime is
-            // its UpdatedAt.
-            var point = Read(FullLine);
-
-            Assert.AreEqual(point.Time, point.EndTime);
-            Assert.AreEqual(new DateTime(2024, 2, 14, 17, 30, 0), point.EndTime);
-        }
-
-        [Test]
         public void ReleaseIsStampedAfterTheQuarterItReports()
         {
             // The lag from the reported quarter to publication is the product here: measured across
@@ -334,9 +321,6 @@ namespace QuantConnect.DataLibrary.Tests
             var unnumbered = type
                 .GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
                 .Where(property => property.CanRead && property.CanWrite && property.GetIndexParameters().Length == 0)
-                // EndTime is a view over Time, which BaseData already numbers, so it stores nothing
-                // of its own and a member number on it would serialize the same instant twice.
-                .Where(property => property.Name != nameof(BaseData.EndTime))
                 .Where(property => property.GetCustomAttribute<ProtoMemberAttribute>() == null)
                 .Select(property => property.Name)
                 .ToList();

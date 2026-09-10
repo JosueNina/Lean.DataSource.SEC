@@ -41,7 +41,7 @@ with the dataset **Symbol**. **Slice** objects deliver unique events to your alg
 happen, but the **Slice** may not contain data for your dataset at every time step. Positions are
 reported quarterly, but the managers of one quarter file across roughly fifty different days, so
 publication is close to continuous: measured on the processed files a security carries a release on
-a median of 108 days a year, and a widely held name on 234 of the roughly 250 business days. Check
+a median of 111 days a year, and a widely held name on 234 of the roughly 250 business days. Check
 that the **Slice** contains the data you want before you index it.
 
 ```python
@@ -94,15 +94,13 @@ quarter that ended typically 45 to 135 days ago, with late amendments arriving y
 single day of filings carries several different reported quarters. Read `PeriodEnd` whenever you
 need the quarter a point describes rather than the day it arrived.
 
-That last point has a consequence worth knowing before you build on it. A **Slice** holds one data
-point per **Symbol** per timestamp, so when a filing date carries several reported quarters for the
-same security, **OnData** sees exactly one of them: the highest `PeriodEnd`, which during a quarter
-handover is the thin new quarter rather than the finished one. Measured over the fourth quarter of
-2020 across AAPL, GOOGL and SPY, the files hold 371 rows and **OnData** received 170, one per
-security per filing date, with 95 of those dates carrying more than one quarter. **History** returns
-all of them, and so does the universe file, which ships both live quarters as separate records on
-purpose. If the finished quarter is the one your strategy wants, read it from **History** or from
-`SEC13FHoldingsUniverse` rather than from **OnData**.
+That last point has a consequence worth knowing before you build on it. A filing date often carries
+several reported quarters for the same security, and indexing the **Slice** by **Symbol** returns
+one data point per timestamp: the highest `PeriodEnd`, which during a quarter handover is the thin
+new quarter rather than the finished one. Iterate `slice.AllData` (`slice.all_data` in Python) to
+see every quarter reported that day, and read `PeriodEnd` before comparing `Holders` across points.
+**History** returns all of them too, and the universe file ships both live quarters as separate
+records on purpose.
 
 Every value is cumulative for its `PeriodEnd`, counting every filing for that quarter that was
 public by the point's timestamp. You do not have to accumulate anything yourself, and you should

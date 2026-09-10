@@ -107,21 +107,14 @@ namespace QuantConnect.DataSource
         [ProtoMember(19)]
         public bool ConfidentialOmitted { get; set; }
 
-        /// <summary>
-        /// The moment the point became public, which is the SEC FILING_DATE at EDGAR's same-day
-        /// acceptance cutoff. There is no separate publication offset to model: the point IS the
-        /// publication, and the quarter it describes is PeriodEnd.
-        /// </summary>
-        // Both accessors, so a caller that assigns EndTime moves the one timestamp this type has
-        // rather than leaving the inherited setter to write a value the getter then contradicts.
-        public override DateTime EndTime
-        {
-            get { return Time; }
-            set { Time = value; }
-        }
-
         /// <summary>Name of the dataset's folder under alternative/sec/, which is where its files live.</summary>
         public static string ReportFolder => "13f";
+
+        /// <summary>Parses one measure column, where an empty field is an absent reading.</summary>
+        internal static decimal? ParseMeasure(string value)
+        {
+            return value.IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
+        }
 
         /// <summary>Creates a new default instance.</summary>
         public SEC13FHoldings()
@@ -133,14 +126,14 @@ namespace QuantConnect.DataSource
         {
             Time = DateTime.ParseExact(csv[0], "yyyyMMdd HH:mm", CultureInfo.InvariantCulture);
             PeriodEnd = DateTime.ParseExact(csv[1], "yyyyMMdd", CultureInfo.InvariantCulture);
-            Holders = csv[2].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
-            Shares = csv[3].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
-            HoldingValue = csv[4].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
-            CallShares = csv[5].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
-            PutShares = csv[6].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
-            PrincipalValue = csv[7].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
-            VotingSole = csv[8].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
-            VotingShared = csv[9].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
+            Holders = ParseMeasure(csv[2]);
+            Shares = ParseMeasure(csv[3]);
+            HoldingValue = ParseMeasure(csv[4]);
+            CallShares = ParseMeasure(csv[5]);
+            PutShares = ParseMeasure(csv[6]);
+            PrincipalValue = ParseMeasure(csv[7]);
+            VotingSole = ParseMeasure(csv[8]);
+            VotingShared = ParseMeasure(csv[9]);
             ConfidentialOmitted = csv[10] == "1";
             Value = HoldingValue ?? 0m;
         }

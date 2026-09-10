@@ -13,6 +13,7 @@
  * limitations under the License.
 */
 
+using System;
 using System.Linq;
 using System.Collections.Generic;
 using QuantConnect.Data;
@@ -36,8 +37,9 @@ namespace QuantConnect.DataLibrary.Tests
         /// <summary>Tradeable equity symbol, keyed by the 13F data symbol subscribed on it.</summary>
         private readonly Dictionary<Symbol, Symbol> _equityByDataSymbol = new Dictionary<Symbol, Symbol>();
 
-        /// <summary>Latest reported number of institutional holders, keyed by equity symbol.</summary>
-        private readonly Dictionary<Symbol, decimal> _holdersByEquity = new Dictionary<Symbol, decimal>();
+        /// <summary>Latest number of institutional holders per reported quarter, keyed by equity symbol.</summary>
+        private readonly Dictionary<Symbol, SortedDictionary<DateTime, decimal>> _holdersByEquity =
+            new Dictionary<Symbol, SortedDictionary<DateTime, decimal>>();
 
         private Symbol _invested;
 
@@ -73,31 +75,27 @@ namespace QuantConnect.DataLibrary.Tests
         /// <param name="slice">Slice object keyed by symbol containing the data</param>
         public override void OnData(Slice slice)
         {
-            var holdings = slice.Get<SEC13FHoldings>();
-
-            foreach (var kvp in _equityByDataSymbol)
+            // One filing date can carry several reported quarters of the same security, and the
+            // Slice keeps one point per symbol, so slice.Get would hand over only the newest quarter.
+            // AllData carries every one of them.
+            foreach (var holding in slice.AllData.OfType<SEC13FHoldings>())
             {
-                if (!holdings.ContainsKey(kvp.Key))
+                if (!_equityByDataSymbol.TryGetValue(holding.Symbol, out var equity) || !holding.Holders.HasValue)
                 {
                     continue;
                 }
 
-                var equity = kvp.Value;
-                var holding = holdings[kvp.Key];
+                // Time is the filing date and PeriodEnd the quarter the numbers describe, typically
+                // 45 to 135 days earlier. Every value is cumulative for PeriodEnd: it counts every
+                // manager that had reported the security by this date.
+                Log($"{Time:yyyy-MM-dd} {equity.Value} - Period: {holding.PeriodEnd:yyyy-MM-dd}, Holders: {holding.Holders}, Shares: {holding.Shares}, HoldingValue: {holding.HoldingValue}");
 
-                // Point-in-time shape: Time and EndTime are both the filing date, and the quarter
-                // the numbers describe is PeriodEnd. A point therefore arrives typically 45 to 135
-                // days after the quarter it reports, with late amendments arriving years later, and
-                // the algorithm sees it on the day it became public, exactly like a live manager
-                // would. That lag is the product, not a defect.
-                // Every value is cumulative for PeriodEnd: it counts every manager that had reported
-                // the security by this date, not only the ones that filed today.
-                Log($"{Time:yyyy-MM-dd} {equity.Value} - Period: {holding.PeriodEnd:yyyy-MM-dd}, Filed: {holding.EndTime:yyyy-MM-dd}, Holders: {holding.Holders}, Shares: {holding.Shares}, HoldingValue: {holding.HoldingValue}");
-
-                if (holding.Holders.HasValue)
+                if (!_holdersByEquity.TryGetValue(equity, out var quarters))
                 {
-                    _holdersByEquity[equity] = holding.Holders.Value;
+                    _holdersByEquity[equity] = quarters = new SortedDictionary<DateTime, decimal>();
                 }
+
+                quarters[holding.PeriodEnd] = holding.Holders.Value;
             }
 
             if (_holdersByEquity.Count == 0)
@@ -105,10 +103,12 @@ namespace QuantConnect.DataLibrary.Tests
                 return;
             }
 
-            // Hold the name the largest number of institutions report. Rebalancing only when the
-            // leader changes keeps the demo down to a handful of orders.
+            // Hold the name the most institutions report. Breadth is the larger of the two newest
+            // quarters, so a quarter that is still filling in does not hide the finished one: the
+            // same rule the universe file applies. Rebalancing only when the leader changes keeps
+            // the demo down to a handful of orders.
             var leader = _holdersByEquity
-                .OrderByDescending(kvp => kvp.Value)
+                .OrderByDescending(kvp => kvp.Value.Values.Reverse().Take(2).Max())
                 .ThenBy(kvp => kvp.Key.Value)
                 .First()
                 .Key;

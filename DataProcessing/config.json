@@ -1,6 +1,4 @@
 {
     "temp-output-directory": "/temp-output-directory",
-    "data-folder": "../../../Data/",
-
-    "dataset-name": "13f"
+    "data-folder": "../../../Data/"
 }

@@ -19,7 +19,6 @@ using System.Globalization;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
-using System.Net.Http;
 using System.Text.RegularExpressions;
 using QuantConnect.Logging;
 
@@ -29,33 +28,20 @@ namespace QuantConnect.DataProcessing
     /// CUSIP to ticker crosswalk built from the SEC Form N-PORT data sets, used as the last step of
     /// the 13F identity chain.
     ///
-    /// Why it exists. A 13F reports a CUSIP and nothing else, and the first two steps of the chain
-    /// resolve a CUSIP through LEAN's security database, which does not carry every issuer: it is
-    /// missing names as large as Alphabet, and for foreign issuers filing under a CINS the
-    /// arithmetic US ISIN is wrong by construction. N-PORT is the SEC's own fund holdings data set
-    /// and it publishes, for the same securities, both the CUSIP and the ticker the fund reported.
-    /// Joining the two tables therefore yields a CUSIP to ticker map made entirely out of filings,
-    /// and a ticker resolves to a LEAN Symbol through the map files, which ship with the engine.
+    /// A 13F reports a CUSIP and nothing else, and LEAN's security database does not carry every
+    /// issuer: it misses names as large as Alphabet, and for foreign issuers filing under a CINS the
+    /// arithmetic US ISIN is wrong by construction. N-PORT publishes, for the same securities, both
+    /// the CUSIP and the ticker the fund reported, so joining its tables yields a CUSIP to ticker
+    /// map made entirely out of filings. On the March to May 2026 13F window it covers 98.1 percent
+    /// of reported value, against 88.9 percent for the security database steps on their own.
     ///
-    /// Measured on the 2026 Q1 data set against the March to May 2026 13F window:
+    /// The ticker is free text written by fund administrators ("GOOGL", "GOOGL US", "goog"), so it
+    /// is normalised and voted on across every fund that reported the security. Each entry keeps the
+    /// day its data set begins, because a ticker only names a security on a date: META named a
+    /// Roundhill ETF from June 2021 to January 2022, before Facebook took it.
     ///
-    ///     24,790 CUSIPs in the window, 74.68 trillion dollars of reported value
-    ///      7,775 carry a ticker here, covering 98.1 percent of that value
-    ///        911 of those are CINS foreign issuers, 4.2 percent of value, which the
-    ///            constructed ISIN cannot reach at all
-    ///      7,416 of the 7,775, or 95.4 percent, have every fund reporting the same ticker
-    ///
-    /// against 88.9 percent of value for the CUSIP and constructed-ISIN steps on their own.
-    ///
-    /// Two properties of the raw field matter. It is free text written by fund administrators, so
-    /// it arrives as "GOOGL", "GOOGL US" and "goog" for the same security and has to be normalised
-    /// and voted on rather than trusted row by row. And it is populated on only 6.9 percent of the
-    /// identifier rows, so a naive one-row-per-CUSIP sample badly understates the coverage: the
-    /// vote has to run across every fund that reported the security.
-    ///
-    /// The limit worth knowing. N-PORT begins in late 2019 while the 13F history begins in 2013 Q2,
-    /// so a security that stopped trading before N-PORT existed will never appear here and still
-    /// depends on the security database.
+    /// N-PORT begins in late 2019, so a security that stopped trading before then never appears
+    /// here and still depends on the security database.
     /// </summary>
     public static class SEC13FTickerCrosswalk
     {
@@ -65,8 +51,14 @@ namespace QuantConnect.DataProcessing
         private const string HoldingTable = "FUND_REPORTED_HOLDING.tsv";
         private const string IdentifierTable = "IDENTIFIERS.tsv";
 
-        /// <summary>The file the built map is cached in, so a rerun does not re-download gigabytes.</summary>
-        public const string CacheFileName = "nport-cusip-tickers.csv";
+        /// <summary>
+        /// The file the built map is cached in, so the next run does not re-download gigabytes. Not
+        /// a .csv, so nothing that walks the security files mistakes it for one.
+        /// </summary>
+        public const string CacheFileName = "nport-crosswalk.txt";
+
+        /// <summary>The ticker the funds reported for a CUSIP, and the first day of the data set it came from.</summary>
+        public readonly record struct Entry(string Ticker, DateTime Observed);
 
         /// <summary>
         /// Tickers arrive with a venue suffix in the Bloomberg style ("GOOGL US"), in lower case,
@@ -77,17 +69,20 @@ namespace QuantConnect.DataProcessing
         private static readonly Regex TickerShape = new(@"^[A-Z.\-]{1,8}$", RegexOptions.Compiled);
 
         /// <summary>
-        /// Loads the crosswalk, building it from the newest <paramref name="quarters"/> N-PORT data
-        /// sets when the cache does not already cover them. Returns CUSIP (9 characters, as the SEC
-        /// writes it) to ticker.
+        /// Loads the crosswalk cached in <paramref name="readDirectory"/>, building it from the
+        /// newest <paramref name="quarters"/> N-PORT data sets when the cache does not cover them and
+        /// writing the result to <paramref name="writeDirectory"/>. <paramref name="exists"/> says
+        /// whether a data set is published and <paramref name="download"/> puts one on disk, both
+        /// through the caller's rate limit and retries.
         /// </summary>
-        public static Dictionary<string, string> Load(HttpClient client, string cacheDirectory, int quarters)
+        public static Dictionary<string, Entry> Load(string readDirectory, string writeDirectory, int quarters,
+            Func<string, bool> exists, Func<string, string, string> download)
         {
-            var cachePath = Path.Combine(cacheDirectory, CacheFileName);
-            var cached = ReadCache(cachePath, out var cachedQuarters);
+            var cached = ReadCache(Path.Combine(readDirectory, CacheFileName), out var cachedQuarters);
 
-            var available = FindAvailableQuarters(client, quarters);
-            var missing = available.Where(quarter => !cachedQuarters.Contains(QuarterKey(quarter))).ToList();
+            var missing = FindAvailableQuarters(quarters, exists)
+                .Where(quarter => !cachedQuarters.Contains(QuarterKey(quarter)))
+                .ToList();
 
             if (missing.Count == 0)
             {
@@ -95,26 +90,48 @@ namespace QuantConnect.DataProcessing
                 return cached;
             }
 
+            var downloads = new List<string>();
             foreach (var (year, quarter) in missing)
             {
-                foreach (var (cusip, ticker) in BuildFromQuarter(client, year, quarter))
-                {
-                    // Newer quarters win, so a security that changed ticker keeps the recent one.
-                    // The map files then take that ticker back to the right Symbol for an old date.
-                    cached[cusip] = ticker;
-                }
+                var path = download(Url(year, quarter), $"{QuarterKey((year, quarter))}_nport.zip");
+                downloads.Add(path);
 
+                Fold(cached, QuarterStart(year, quarter), BuildFromQuarter(path, year, quarter));
                 cachedQuarters.Add(QuarterKey((year, quarter)));
             }
 
-            WriteCache(cachePath, cached, cachedQuarters);
+            WriteCache(Path.Combine(writeDirectory, CacheFileName), cached, cachedQuarters);
+
+            // The derived map is what is kept; each archive is several hundred megabytes.
+            foreach (var path in downloads)
+            {
+                File.Delete(path);
+            }
+
             Log.Trace($"SEC13FTickerCrosswalk.Load(): {cached.Count} CUSIPs after folding in " +
                       $"{string.Join(", ", missing.Select(QuarterKey))}");
             return cached;
         }
 
+        /// <summary>
+        /// Folds one data set's tickers into the map. The newest observation of a CUSIP wins whatever
+        /// order the data sets arrive in: a first build walks back from today, while a refresh adds
+        /// one newer quarter on top of the cache.
+        /// </summary>
+        internal static void Fold(Dictionary<string, Entry> map, DateTime observed,
+            IEnumerable<KeyValuePair<string, string>> tickers)
+        {
+            foreach (var (cusip, ticker) in tickers)
+            {
+                if (!map.TryGetValue(cusip, out var held) || held.Observed <= observed)
+                {
+                    map[cusip] = new Entry(ticker, observed);
+                }
+            }
+        }
+
         /// <summary>Walks back from the current quarter until it has found the requested number of data sets.</summary>
-        private static List<(int Year, int Quarter)> FindAvailableQuarters(HttpClient client, int quarters)
+        private static List<(int Year, int Quarter)> FindAvailableQuarters(int quarters, Func<string, bool> exists)
         {
             var found = new List<(int, int)>();
             var probe = DateTime.UtcNow;
@@ -125,10 +142,7 @@ namespace QuantConnect.DataProcessing
             {
                 var year = probe.Year;
                 var quarter = (probe.Month - 1) / 3 + 1;
-
-                using var request = new HttpRequestMessage(HttpMethod.Head, Url(year, quarter));
-                using var response = client.Send(request);
-                if (response.IsSuccessStatusCode)
+                if (exists(Url(year, quarter)))
                 {
                     found.Add((year, quarter));
                 }
@@ -137,7 +151,7 @@ namespace QuantConnect.DataProcessing
             if (found.Count == 0)
             {
                 throw new InvalidOperationException(
-                    "SEC13FTickerCrosswalk.FindAvailableQuarters(): no N-PORT data set responded");
+                    "SEC13FTickerCrosswalk.FindAvailableQuarters(): no N-PORT data set is published");
             }
 
             return found;
@@ -145,21 +159,13 @@ namespace QuantConnect.DataProcessing
 
         /// <summary>
         /// Builds the map for one quarter. Two passes over the archive, because the tables join on
-        /// HOLDING_ID and neither is sorted: the first collects the identifier rows that actually
-        /// carry a ticker, which is only 6.9 percent of them and therefore small enough to hold,
-        /// and the second votes those tickers onto the CUSIP each holding belongs to.
+        /// HOLDING_ID and neither is sorted: the first collects the identifier rows that carry a
+        /// ticker, only 6.9 percent of them, and the second votes those tickers onto the CUSIP each
+        /// holding belongs to.
         /// </summary>
-        private static IEnumerable<KeyValuePair<string, string>> BuildFromQuarter(HttpClient client, int year, int quarter)
+        private static IEnumerable<KeyValuePair<string, string>> BuildFromQuarter(string path, int year, int quarter)
         {
-            var url = Url(year, quarter);
-            Log.Trace($"SEC13FTickerCrosswalk.BuildFromQuarter(): downloading {url}");
-
-            using var stream = client.GetStreamAsync(url).GetAwaiter().GetResult();
-            using var buffer = new MemoryStream();
-            stream.CopyTo(buffer);
-            buffer.Position = 0;
-
-            using var archive = new ZipArchive(buffer, ZipArchiveMode.Read);
+            using var archive = ZipFile.OpenRead(path);
 
             var tickersByHolding = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var fields in ReadTable(archive, IdentifierTable, "HOLDING_ID", "IDENTIFIER_TICKER"))
@@ -201,47 +207,18 @@ namespace QuantConnect.DataProcessing
 
             return votes.Select(pair => new KeyValuePair<string, string>(
                 pair.Key,
-                pair.Value.OrderByDescending(vote => vote.Value).ThenBy(vote => vote.Key, StringComparer.Ordinal).First().Key));
+                pair.Value.OrderByDescending(vote => vote.Value).ThenBy(vote => vote.Key, StringComparer.Ordinal).First().Key))
+                .ToList();
         }
 
-        /// <summary>Streams the requested columns of one tab separated table out of the archive.</summary>
+        /// <summary>
+        /// The requested columns of one N-PORT table. Short rows are skipped rather than thrown on,
+        /// so one malformed holding cannot stop the whole build.
+        /// </summary>
         private static IEnumerable<string[]> ReadTable(ZipArchive archive, string table, params string[] wanted)
         {
-            var entry = archive.Entries.FirstOrDefault(
-                            candidate => candidate.FullName.EndsWith(table, StringComparison.OrdinalIgnoreCase))
-                        ?? throw new FileNotFoundException($"{table} is missing from the N-PORT archive");
-
-            using var reader = new StreamReader(entry.Open());
-
-            var header = reader.ReadLine()?.Split('\t');
-            if (header == null)
-            {
-                throw new FormatException($"{table} is empty");
-            }
-
-            var indexes = wanted.Select(column =>
-            {
-                var index = Array.IndexOf(header, column);
-                if (index < 0)
-                {
-                    throw new FormatException($"{table} has no column {column}");
-                }
-
-                return index;
-            }).ToArray();
-
-            var widest = indexes.Max();
-            string line;
-            while ((line = reader.ReadLine()) != null)
-            {
-                var fields = line.Split('\t');
-                if (fields.Length <= widest)
-                {
-                    continue;
-                }
-
-                yield return indexes.Select(index => fields[index]).ToArray();
-            }
+            return SEC13FFiles.ReadTable(archive, "N-PORT", table, skipShortRows: true, wanted)
+                .Select(row => wanted.Select(column => row.Fields[row.Columns[column]]).ToArray());
         }
 
         /// <summary>Cleans one raw ticker, returning null when it is not usable.</summary>
@@ -257,9 +234,12 @@ namespace QuantConnect.DataProcessing
         private static string QuarterKey((int Year, int Quarter) quarter)
             => $"{quarter.Year}q{quarter.Quarter}";
 
-        private static Dictionary<string, string> ReadCache(string path, out HashSet<string> quarters)
+        private static DateTime QuarterStart(int year, int quarter)
+            => new(year, quarter * 3 - 2, 1);
+
+        private static Dictionary<string, Entry> ReadCache(string path, out HashSet<string> quarters)
         {
-            var map = new Dictionary<string, string>(StringComparer.Ordinal);
+            var map = new Dictionary<string, Entry>(StringComparer.Ordinal);
             quarters = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             if (!File.Exists(path))
@@ -277,26 +257,32 @@ namespace QuantConnect.DataProcessing
                 }
 
                 var fields = line.Split(',');
-                if (fields.Length == 2 && fields[0].Length == 9)
+                if (fields.Length == 3 && fields[0].Length == 9)
                 {
-                    map[fields[0]] = fields[1];
+                    map[fields[0]] = new Entry(fields[1],
+                        DateTime.ParseExact(fields[2], DateFormat.EightCharacter, CultureInfo.InvariantCulture));
                 }
             }
 
             return map;
         }
 
-        private static void WriteCache(string path, Dictionary<string, string> map, HashSet<string> quarters)
+        private static void WriteCache(string path, Dictionary<string, Entry> map, HashSet<string> quarters)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(path));
 
             var lines = new List<string> { "#" + string.Join(",", quarters.OrderBy(value => value, StringComparer.Ordinal)) };
             lines.AddRange(map.OrderBy(pair => pair.Key, StringComparer.Ordinal)
-                .Select(pair => $"{pair.Key},{pair.Value}"));
+                .Select(pair => $"{pair.Key},{pair.Value.Ticker},{pair.Value.Observed.ToString(DateFormat.EightCharacter, CultureInfo.InvariantCulture)}"));
 
-            var temporaryPath = path + ".tmp";
-            File.WriteAllLines(temporaryPath, lines);
-            File.Move(temporaryPath, path, overwrite: true);
+            SEC13FFiles.WriteThenMove(path, stream =>
+            {
+                using var writer = new StreamWriter(stream, leaveOpen: true);
+                foreach (var line in lines)
+                {
+                    writer.WriteLine(line);
+                }
+            });
         }
     }
 }

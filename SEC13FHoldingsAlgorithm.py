@@ -37,7 +37,7 @@ class SEC13FHoldingsAlgorithm(QCAlgorithm):
         # Tradeable equity symbol, keyed by the 13F data symbol subscribed on it.
         self._equity_by_data_symbol = {}
 
-        # Latest reported number of institutional holders, keyed by equity symbol.
+        # Latest number of institutional holders per reported quarter, keyed by equity symbol.
         self._holders_by_equity = {}
 
         self._invested = None
@@ -52,32 +52,34 @@ class SEC13FHoldingsAlgorithm(QCAlgorithm):
             self._equity_by_data_symbol[data_symbol] = equity
 
     def on_data(self, slice: Slice) -> None:
-        holdings = slice.get(SEC13FHoldings)
-
-        for data_symbol, equity in self._equity_by_data_symbol.items():
-            if data_symbol not in holdings:
+        # One filing date can carry several reported quarters of the same security, and the Slice
+        # keeps one point per symbol, so slice.get would hand over only the newest quarter.
+        # all_data carries every one of them.
+        for holding in slice.all_data:
+            if not isinstance(holding, SEC13FHoldings) or holding.holders is None:
+                continue
+            equity = self._equity_by_data_symbol.get(holding.symbol)
+            if equity is None:
                 continue
 
-            holding = holdings[data_symbol]
+            # time is the filing date and period_end the quarter the numbers describe, typically 45
+            # to 135 days earlier. Every value is cumulative for period_end: it counts every manager
+            # that had reported the security by this date.
+            self.log(f"{self.time:%Y-%m-%d} {equity.value} - Period: {holding.period_end:%Y-%m-%d}, Holders: {holding.holders}, Shares: {holding.shares}, HoldingValue: {holding.holding_value}")
 
-            # Point-in-time shape: time and end_time are both the filing date, and the quarter
-            # the numbers describe is period_end. A point therefore arrives typically 45 to 135
-            # days after the quarter it reports, with late amendments arriving years later, and
-            # the algorithm sees it on the day it became public, exactly like a live manager
-            # would. That lag is the product, not a defect.
-            # Every value is cumulative for period_end: it counts every manager that had reported
-            # the security by this date, not only the ones that filed today.
-            self.log(f"{self.time:%Y-%m-%d} {equity.value} - Period: {holding.period_end:%Y-%m-%d}, Filed: {holding.end_time:%Y-%m-%d}, Holders: {holding.holders}, Shares: {holding.shares}, HoldingValue: {holding.holding_value}")
-
-            if holding.holders is not None:
-                self._holders_by_equity[equity] = holding.holders
+            self._holders_by_equity.setdefault(equity, {})[holding.period_end] = holding.holders
 
         if not self._holders_by_equity:
             return
 
-        # Hold the name the largest number of institutions report. Rebalancing only when the leader
-        # changes keeps the demo down to a handful of orders.
-        leader = sorted(self._holders_by_equity.items(), key=lambda kvp: (-kvp[1], kvp[0].value))[0][0]
+        # Hold the name the most institutions report. Breadth is the larger of the two newest
+        # quarters, so a quarter that is still filling in does not hide the finished one: the same
+        # rule the universe file applies. Rebalancing only when the leader changes keeps the demo
+        # down to a handful of orders.
+        def breadth(quarters):
+            return max(quarters[period] for period in sorted(quarters)[-2:])
+
+        leader = sorted(self._holders_by_equity.items(), key=lambda kvp: (-breadth(kvp[1]), kvp[0].value))[0][0]
 
         # A 13F lands on its filing date, which is not necessarily a day the equity printed a bar,
         # so the order waits for a price rather than firing against a stale one.

@@ -46,6 +46,9 @@ namespace QuantConnect.DataProcessing
         /// </summary>
         private const string ReportsDatasetName = "reports";
 
+        /// <summary>Config key that asks the 13F run to rebuild the whole history instead of one date.</summary>
+        internal const string RebuildHistoryKey = "sec-13f-rebuild-history";
+
         /// <summary>
         /// Entrypoint of the program. The exit code is returned rather than handed to
         /// <see cref="Environment.Exit"/> from inside the work: that call does not unwind the stack,
@@ -117,9 +120,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Downloads and converts the Form 13F institutional holdings dataset. Without a deployment
-        /// date the run walks every published archive; with one it reads the archive whose window
-        /// covers that date and folds it into the published history.
+        /// Downloads and converts the Form 13F institutional holdings dataset for the deployment date,
+        /// folding it into the published history, or rebuilds the whole history when asked to.
         /// </summary>
         /// <returns>Zero on success, one on any failure</returns>
         private static int Process13F()
@@ -138,9 +140,8 @@ namespace QuantConnect.DataProcessing
                 "alternative",
                 SEC13FDownloader.VendorName);
 
-            // Where downloads are kept between runs. The job syncs this folder to the archive store
-            // after every run, the same one the reports dataset keeps its feed archives in, so it is
-            // the one place a cache survives the container.
+            // Where downloads land. The job archives this folder after every run, as it does the
+            // reports dataset's feed archives, but does not restore it before the next.
             var rawDataDirectory = Path.Combine(
                 Config.Get("raw-data-folder", "/raw"),
                 "alternative",
@@ -169,11 +170,7 @@ namespace QuantConnect.DataProcessing
 
             try
             {
-                if (!downloader.Run())
-                {
-                    Log.Error($"DataProcessing.Process13F(): Failed to download/process {SEC13FDownloader.DatasetName} data");
-                    return 1;
-                }
+                downloader.Run();
 
                 timer.Stop();
                 Log.Trace($"DataProcessing.Process13F(): Conversion finished in time {timer.Elapsed}");
@@ -191,18 +188,27 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Reads the deployment date the job runs for.
+        /// Reads the deployment date the job runs for. A missing date is a misconfigured job rather
+        /// than a request for the whole history, which is asked for by name with
+        /// <see cref="RebuildHistoryKey"/>.
         /// </summary>
-        /// <param name="deploymentDate">The date, or null when the run should take the whole history</param>
-        /// <returns>True when the variable was absent or well formed</returns>
-        private static bool TryParseDeploymentDate(out DateTime? deploymentDate)
+        /// <param name="deploymentDate">The date, or null when the run rebuilds the whole history</param>
+        /// <returns>True when the date is well formed, or absent with the rebuild asked for</returns>
+        internal static bool TryParseDeploymentDate(out DateTime? deploymentDate)
         {
             deploymentDate = null;
 
             var raw = Environment.GetEnvironmentVariable("QC_DATAFLEET_DEPLOYMENT_DATE");
             if (string.IsNullOrWhiteSpace(raw))
             {
-                return true;
+                if (Config.GetBool(RebuildHistoryKey))
+                {
+                    return true;
+                }
+
+                Log.Error("DataProcessing.TryParseDeploymentDate(): QC_DATAFLEET_DEPLOYMENT_DATE is not set. Set it, or " +
+                          $"set \"{RebuildHistoryKey}\": true to rebuild the whole history");
+                return false;
             }
 
             // A malformed date must not quietly become a full history run: that would turn a daily

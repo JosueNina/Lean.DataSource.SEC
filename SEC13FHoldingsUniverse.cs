@@ -137,20 +137,20 @@ namespace QuantConnect.DataSource
                 return null;
             }
 
-            var holdingValue = csv[5].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture));
+            var holdingValue = SEC13FHoldings.ParseMeasure(csv[5]);
             return new SEC13FHoldingsUniverse
             {
                 Symbol = new Symbol(SecurityIdentifier.Parse(csv[0]), csv[1]),
                 Time = date,
                 PeriodEnd = DateTime.ParseExact(csv[2], "yyyyMMdd", CultureInfo.InvariantCulture),
-                Holders = csv[3].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture)),
-                Shares = csv[4].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture)),
+                Holders = SEC13FHoldings.ParseMeasure(csv[3]),
+                Shares = SEC13FHoldings.ParseMeasure(csv[4]),
                 HoldingValue = holdingValue,
-                CallShares = csv[6].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture)),
-                PutShares = csv[7].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture)),
-                PrincipalValue = csv[8].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture)),
-                VotingSole = csv[9].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture)),
-                VotingShared = csv[10].IfNotNullOrEmpty<decimal?>(s => decimal.Parse(s, NumberStyles.Any, CultureInfo.InvariantCulture)),
+                CallShares = SEC13FHoldings.ParseMeasure(csv[6]),
+                PutShares = SEC13FHoldings.ParseMeasure(csv[7]),
+                PrincipalValue = SEC13FHoldings.ParseMeasure(csv[8]),
+                VotingSole = SEC13FHoldings.ParseMeasure(csv[9]),
+                VotingShared = SEC13FHoldings.ParseMeasure(csv[10]),
                 ConfidentialOmitted = csv[11] == "1",
                 Value = holdingValue ?? 0m
             };

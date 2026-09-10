@@ -11,7 +11,6 @@
   <ItemGroup>
     <PackageReference Include="QuantConnect.Common" Version="2.5.*" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
-    <PackageReference Include="protobuf-net" Version="3.1.33" />
   </ItemGroup>
 
   <ItemGroup>
