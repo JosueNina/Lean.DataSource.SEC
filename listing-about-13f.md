@@ -1,0 +1,186 @@
+## Introduction
+
+The SEC Form 13F Institutional Holdings dataset by the U.S. Securities and Exchange Commission
+tracks how much of each US Equity institutional managers report holding, from the second quarter
+of 2013 to the present. Every institutional investment manager exercising discretion over at least
+100 million dollars must file a Form 13F within 45 days of the end of a calendar quarter, listing
+the covered securities it holds. This dataset sums those filings per security, so one data point
+answers how many managers hold a name and how much of it they hold. Data arrives on the day each
+filing becomes public, which for a quarterly filing regime means a burst of activity around each
+deadline and a long tail of late filers and amendments.
+
+The reporting lag is the product, not an inconvenience to be hidden. A position is typically 45 to
+135 days old by the time it reaches the public record, with late amendments arriving years later,
+so a data point is stamped with the day the filing became public and carries the quarter it reports
+in `PeriodEnd`. Measured across 11,761 filings in one window, the lag from the reported quarter end
+to the filing date runs minimum 0 days, p10 16, median 42, p90 48, maximum 6,596, with 10.4 percent
+of filings arriving later than the 45 day deadline. Delivering a position on the quarter end it describes would inject every day
+of that gap as look-ahead, so LEAN delivers it on the day the market could first read it.
+
+Every value is cumulative for its `PeriodEnd`. The managers of a single quarter file across roughly
+fifty different days, so a data point counts every filing for that quarter that was public by its
+timestamp rather than only the ones made that day. Reading Apple on the busiest day of the March
+2026 quarter gives 5,920 reporting managers and 10,062,977,792 shares, not the 602 managers who
+reported it for the first time that day.
+
+## About the Provider
+
+The [U.S. Securities and Exchange Commission](https://www.sec.gov) is the federal agency that
+regulates the US securities markets. Form 13F is filed through EDGAR, the SEC's electronic filing
+system, and the agency's Division of Economic and Risk Analysis republishes those filings as
+structured, tab separated data sets, one archive per period. That published product is what this
+dataset is built from, so the XML extraction is the SEC's own work rather than ours. The data is
+public domain, needs no account and no API key, and the only access requirement is the descriptive
+User-Agent header that SEC policy asks of all automated readers.
+
+## Getting Started
+
+```python
+self._symbol = self.add_equity("AAPL", Resolution.DAILY).symbol
+self._holdings_symbol = self.add_data(SEC13FHoldings, self._symbol).symbol
+```
+```csharp
+_symbol = AddEquity("AAPL", Resolution.Daily).Symbol;
+_holdingsSymbol = AddData<SEC13FHoldings>(_symbol).Symbol;
+```
+
+## Data Summary
+
+The following table describes the dataset properties:
+
+| Property | Value |
+| --- | --- |
+| Start Date | May 2013 |
+| Asset Coverage | 7,125 US Equities |
+| Data Density | Sparse |
+| Resolution | Daily\* |
+| Timezone | America/New_York |
+
+\* Positions are reported quarterly, but the managers of one quarter file across roughly fifty
+different days and several quarters are live at once, so publication is close to continuous rather
+than quarterly. Measured on the processed files over the twelve months to May 2026, a security
+carries a release on a median of 130 days (p10 26, p90 192); a widely held name such as AAPL
+carries one on 242 of the roughly 250 business days.
+
+The history begins on 2013-05-20, the first filing date in the SEC structured data set, whose first
+archive covers the second quarter of 2013. Anything earlier exists only as raw filings in the EDGAR
+full index and is not part of this dataset.
+
+Each data point carries the following fields, all summed across the managers that reported the
+security:
+
+| Property | Meaning |
+| --- | --- |
+| `Holders` | Number of distinct managers, counted by filer CIK, that have reported the security |
+| `Shares` | Shares held, summed over lines with share type SH and no option flag |
+| `HoldingValue` | Market value of those same lines as reported by the managers, and the data point's `Value` |
+| `CallShares` | Shares underlying reported call positions |
+| `PutShares` | Shares underlying reported put positions |
+| `PrincipalValue` | Principal amount of debt instruments reported for the security, share type PRN |
+| `VotingSole` | Shares over which the reporting managers hold sole voting authority |
+| `VotingShared` | Shares over which the reporting managers share voting authority |
+| `ConfidentialOmitted` | True when at least one contributing filing withheld positions under confidential treatment |
+
+Option lines and debt principal are deliberately kept out of `Shares`. One quarter of the source
+carries 61,400 call lines, 57,443 put lines and 15,698 PRN lines, and folding any of them into a
+share count would misstate the position, so they are carried as their own fields instead. For the
+same reason the reported value column is only meaningful under the same filter: summed raw, with
+option and PRN lines left in, it totals 70.1 trillion dollars for a single quarter.
+
+`ConfidentialOmitted` is a point-in-time feature rather than a data quality flag. A manager can ask
+the SEC to withhold specific positions temporarily, so a filing marked this way is incomplete by
+design and the withheld positions appear in a later release.
+
+### How the aggregation was validated
+
+Every reported line is summed. Lines are not deduplicated by investment discretion and lines that
+name another manager are not dropped. That looks like double counting, because 44.3 percent of
+holding lines name another manager and those lines carry 54.9 percent of the reported value, so the
+rule was measured rather than assumed. The three largest holdings of the 2026-03-31 period were
+summed against shares outstanding, counting only share type SH with an empty option flag:
+
+| Security | Raw sum | Sole discretion only | Lines naming no other manager |
+| --- | --- | --- | --- |
+| MSFT | 78.6% | 25.7% | 36.1% |
+| AAPL | 69.8% | 22.7% | 32.9% |
+| NVDA | 72.8% | 23.0% | 33.0% |
+
+Published institutional ownership for these three names sits around 70 to 75 percent. The raw sum
+lands within a few points of it, while both of the obvious defences understate it by about a factor
+of three, because holdings reported under defined discretion are legitimate holdings and dropping
+them throws away most of the institutional base. `Holders`, being a count of distinct filer CIKs, is
+immune to the question either way and is the safer headline field.
+
+That count is taken once per manager: a manager that reports the security on several filings, under
+several of the issuer's CUSIPs, or names it for the first time in an amendment counts once for the
+quarter. Checked against the source tables, Apple's March 2026 quarter reads 6,041 holders where the
+SEC data holds 6,040 to 6,043 distinct managers, depending on which share classes count as Apple.
+
+### Coverage is partial by design
+
+Holdings are keyed by CUSIP in the source and resolved to a LEAN `Symbol` before publication, so no
+identifier from the source is shipped. The resolution runs in three steps, each picking up what the
+one before it could not reach:
+
+1. The CUSIP itself, looked up in LEAN's security database. On its own it accounts for 76.1 percent
+   of the reported value.
+2. The US ISIN, built arithmetically from the same CUSIP. It reaches issuers whose CUSIP column in
+   that database is blank and lifts the two steps together to 88.9 percent of value.
+3. The ticker the SEC's own Form N-PORT filings report for the CUSIP, taken back to a `Symbol`
+   through the map files. This step needs no security database at all and it is what reaches the
+   foreign domiciled issuers whose identifier is really a CINS, for which a constructed US ISIN is
+   wrong by construction. Alphabet is one of them, which is why `GOOGL` appears in the demo
+   algorithms. With this step the chain covers 98.1 percent of reported value on the most recent
+   window.
+
+The real limit is the third step's own history: N-PORT begins in late 2019, so a security that
+stopped trading before then is not reachable through it at any depth and can only be resolved if
+the first two steps already found it. This dataset therefore covers most of the reported dollars
+but not every reported name, and it says so rather than implying full coverage.
+
+Raw sums only. Quarter over quarter change, percentage of shares outstanding, concentration ratios
+and new or closed position counts are all derivable from what is shipped, so they are left to the
+algorithm, which is also the only place that knows the window and the ranking the strategy needs.
+
+## Example Applications
+
+The SEC Form 13F Institutional Holdings dataset lets you see what large managers actually hold and
+trade against how crowded a name is. Examples include the following strategies:
+
+- Screening for crowding by ranking the universe on the number of holders, and for de-crowding by
+  taking the securities whose holder count fell hardest against the previous quarter.
+- Building an ownership change momentum signal from the quarter over quarter move in reported
+  shares, and going long the names institutions are accumulating.
+- Filtering an existing universe by institutional breadth, requiring a minimum holder count before
+  a security is tradeable so that thinly followed names never enter the portfolio.
+- Avoiding names where institutional ownership is collapsing, using a falling holder count and a
+  falling share total together as an exit condition.
+- Reading the reported put and call share totals alongside the share position to see whether
+  managers are hedging a name rather than simply owning it.
+
+## Meta
+
+| Field | Value |
+| --- | --- |
+| name | SEC Form 13F Institutional Holdings |
+| url | sec-form-13f-institutional-holdings |
+| vendorName | U.S. Securities and Exchange Commission |
+| website | https://www.sec.gov |
+| history | May 2013 |
+| reach | 7,125 US Equities |
+| shortDescription | Institutional ownership per US Equity aggregated from every Form 13F filing, published quarterly by the SEC |
+| priceCTA | Free in Cloud |
+| delivery | cloud only |
+
+Tags: Financial Market Data
+
+Licensing card:
+
+```html
+<p>Free access to SEC Form 13F Institutional Holdings in QuantConnect Cloud for use in backtesting or live trading.</p>
+<ul>
+    <li>Quarterly institutional ownership across 7,125 US Equities, delivered on the filing date</li>
+    <li>Holder counts, share and value totals, option and debt lines, and voting authority, per security and as a universe</li>
+    <li>Curated, clean data</li>
+</ul>
+```

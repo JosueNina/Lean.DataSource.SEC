@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -11,6 +11,7 @@
   <ItemGroup>
     <PackageReference Include="QuantConnect.Common" Version="2.5.*" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.2" />
+    <PackageReference Include="protobuf-net" Version="3.1.33" />
   </ItemGroup>
 
   <ItemGroup>
@@ -22,12 +23,10 @@
     <None Remove="process.sample.ipynb" />
     <None Remove="process.sample.py" />
     <None Remove="process.sample.sh" />
-    <Compile Remove="SECReport8KAlgorithm.cs" />
-    <None Remove="SECReport8KAlgorithm.py" />
-    <Compile Remove="SECReportBenchmarkAlgorithm.cs" />
-    <None Remove="SECReportBenchmarkAlgorithm.py" />
-    <Compile Remove="SECReportDataAlgorithm.cs" />
-    <None Remove="SECReportDataAlgorithm.py" />
+    <!-- Demonstration algorithms are documentation, not part of the shipped library. One
+         wildcard rather than a pair of lines per dataset, since this repository hosts several. -->
+    <Compile Remove="**\*Algorithm.cs" />
+    <None Remove="**\*Algorithm.py" />
     <Compile Remove="DataProcessing\**" />
     <EmbeddedResource Remove="DataProcessing\**" />
     <None Remove="DataProcessing\**" />

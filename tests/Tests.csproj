@@ -11,6 +11,10 @@
     <Content Include="..\SECReportBenchmarkAlgorithm.py" Link="SECReportBenchmarkAlgorithm.py" />
     <Compile Include="..\SECReportDataAlgorithm.cs" Link="SECReportDataAlgorithm.cs" />
     <Content Include="..\SECReportDataAlgorithm.py" Link="SECReportDataAlgorithm.py" />
+    <Compile Include="..\SEC13FHoldingsAlgorithm.cs" Link="SEC13FHoldingsAlgorithm.cs" />
+    <Content Include="..\SEC13FHoldingsAlgorithm.py" Link="SEC13FHoldingsAlgorithm.py" />
+    <Compile Include="..\SEC13FHoldingsUniverseSelectionAlgorithm.cs" Link="SEC13FHoldingsUniverseSelectionAlgorithm.cs" />
+    <Content Include="..\SEC13FHoldingsUniverseSelectionAlgorithm.py" Link="SEC13FHoldingsUniverseSelectionAlgorithm.py" />
     <Content Include="TestData\sec_report_raw_single.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -19,6 +23,7 @@
     </Content>
   </ItemGroup>
   <ItemGroup>
+    <PackageReference Include="protobuf-net" Version="3.1.33" />
     <PackageReference Include="NUnit" Version="4.2.2" />
     <PackageReference Include="NUnit3TestAdapter" Version="4.6.0">
       <PrivateAssets>all</PrivateAssets>
