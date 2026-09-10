@@ -186,7 +186,7 @@ press "Approve and run workflows", since fork PRs do not start the workflow on t
 ## Known limits, stated rather than hidden
 
 **Identity resolution is partial by design.** The chain is CUSIP, then the arithmetic US ISIN,
-then the N-PORT ticker crosswalk. On the most recent window it reaches 98.1 percent of
+then the N-PORT ticker crosswalk. On the most recent window it reaches 97.9 percent of
 reported value. Over the full history it reaches 78.9 percent locally, because the crosswalk
 only knows securities that still existed when N-PORT began in late 2019 and the first two
 steps need `security-database.csv`, which QuantConnect does not distribute and which is a one

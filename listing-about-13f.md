@@ -20,7 +20,7 @@ of that gap as look-ahead, so LEAN delivers it on the day the market could first
 Every value is cumulative for its `PeriodEnd`. The managers of a single quarter file across roughly
 fifty different days, so a data point counts every filing for that quarter that was public by its
 timestamp rather than only the ones made that day. Reading Apple on the busiest day of the March
-2026 quarter gives 5,920 reporting managers and 10,062,977,792 shares, not the 602 managers who
+2026 quarter gives 5,920 reporting managers and 9,097,811,804 shares, not the 602 managers who
 reported it for the first time that day.
 
 ## About the Provider
@@ -51,7 +51,7 @@ The following table describes the dataset properties:
 | Property | Value |
 | --- | --- |
 | Start Date | May 2013 |
-| Asset Coverage | 7,125 US Equities |
+| Asset Coverage | 6,880 US Equities |
 | Data Density | Sparse |
 | Resolution | Daily\* |
 | Timezone | America/New_York |
@@ -59,8 +59,8 @@ The following table describes the dataset properties:
 \* Positions are reported quarterly, but the managers of one quarter file across roughly fifty
 different days and several quarters are live at once, so publication is close to continuous rather
 than quarterly. Measured on the processed files over the twelve months to May 2026, a security
-carries a release on a median of 130 days (p10 26, p90 192); a widely held name such as AAPL
-carries one on 242 of the roughly 250 business days.
+carries a release on a median of 114 days (p10 28, p90 170); a widely held name such as AAPL
+carries one on 234 of the roughly 250 business days.
 
 The history begins on 2013-05-20, the first filing date in the SEC structured data set, whose first
 archive covers the second quarter of 2013. Anything earlier exists only as raw filings in the EDGAR
@@ -101,15 +101,23 @@ summed against shares outstanding, counting only share type SH with an empty opt
 
 | Security | Raw sum | Sole discretion only | Lines naming no other manager |
 | --- | --- | --- | --- |
-| MSFT | 78.6% | 25.7% | 36.1% |
-| AAPL | 69.8% | 22.7% | 32.9% |
-| NVDA | 72.8% | 23.0% | 33.0% |
+| MSFT | 71.6% | 25.6% | 29.5% |
+| AAPL | 63.1% | 22.6% | 26.4% |
+| NVDA | 66.0% | 22.9% | 26.6% |
 
-Published institutional ownership for these three names sits around 70 to 75 percent. The raw sum
-lands within a few points of it, while both of the obvious defences understate it by about a factor
-of three, because holdings reported under defined discretion are legitimate holdings and dropping
-them throws away most of the institutional base. `Holders`, being a count of distinct filer CIKs, is
-immune to the question either way and is the safer headline field.
+Published institutional ownership depends on the provider: in 2026 it runs from about 53 to 74
+percent for AAPL, 54 to 70 for NVDA and 72 to 82 for MSFT. The raw sum lands inside those spreads,
+or for MSFT just under them, while both of the obvious defences land far below every published
+figure, because holdings reported under
+defined discretion are legitimate holdings and dropping them throws away most of the institutional
+base. `Holders`, being a count of distinct filer CIKs, is immune to the question either way and is
+the safer headline field.
+
+Amendments are the one place where lines are not simply summed. Most amendments restate the whole
+report, and adding a restatement on top of the report it replaces counted the same position twice:
+for Apple's March 2026 quarter that was 993,574,019 shares, 9.6 percent of the total. An amendment's
+lines therefore count only for a security the manager had not reported for the quarter yet, which is
+what an amendment adding new holdings carries.
 
 That count is taken once per manager: a manager that reports the security on several filings, under
 several of the issuer's CUSIPs, or names it for the first time in an amendment counts once for the
@@ -130,7 +138,7 @@ one before it could not reach:
    through the map files. This step needs no security database at all and it is what reaches the
    foreign domiciled issuers whose identifier is really a CINS, for which a constructed US ISIN is
    wrong by construction. Alphabet is one of them, which is why `GOOGL` appears in the demo
-   algorithms. With this step the chain covers 98.1 percent of reported value on the most recent
+   algorithms. With this step the chain covers 97.9 percent of reported value on the most recent
    window.
 
 The real limit is the third step's own history: N-PORT begins in late 2019, so a security that
@@ -167,7 +175,7 @@ trade against how crowded a name is. Examples include the following strategies:
 | vendorName | U.S. Securities and Exchange Commission |
 | website | https://www.sec.gov |
 | history | May 2013 |
-| reach | 7,125 US Equities |
+| reach | 6,880 US Equities |
 | shortDescription | Institutional ownership per US Equity aggregated from every Form 13F filing, published quarterly by the SEC |
 | priceCTA | Free in Cloud |
 | delivery | cloud only |
@@ -179,7 +187,7 @@ Licensing card:
 ```html
 <p>Free access to SEC Form 13F Institutional Holdings in QuantConnect Cloud for use in backtesting or live trading.</p>
 <ul>
-    <li>Quarterly institutional ownership across 7,125 US Equities, delivered on the filing date</li>
+    <li>Quarterly institutional ownership across 6,880 US Equities, delivered on the filing date</li>
     <li>Holder counts, share and value totals, option and debt lines, and voting authority, per security and as a universe</li>
     <li>Curated, clean data</li>
 </ul>

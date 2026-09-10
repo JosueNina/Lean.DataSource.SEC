@@ -41,7 +41,7 @@ with the dataset **Symbol**. **Slice** objects deliver unique events to your alg
 happen, but the **Slice** may not contain data for your dataset at every time step. Positions are
 reported quarterly, but the managers of one quarter file across roughly fifty different days, so
 publication is close to continuous: measured on the processed files a security carries a release on
-a median of 125 days a year, and a widely held name on 242 of the roughly 250 business days. Check
+a median of 108 days a year, and a widely held name on 234 of the roughly 250 business days. Check
 that the **Slice** contains the data you want before you index it.
 
 ```python
@@ -164,7 +164,7 @@ var history = History<SEC13FHoldings>(_datasetSymbol, TimeSpan.FromDays(730), Re
 Ask for a time span rather than a bar count. A bar count is read in daily bars and the dataset
 publishes on filing dates only, so what comes back depends on how widely the security is held
 rather than on the count you asked for. Measured on the processed files, AAPL carries a release on
-97 of the last 100 business days and on 242 of the last 365 calendar days, while a thinly held name
+96 of the last 100 business days and on 235 of the last 365 calendar days, while a thinly held name
 carries one on closer to 40 days a year. A time span is the safer form whenever you need a known
 number of quarters of history.
 

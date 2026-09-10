@@ -33,6 +33,11 @@ namespace QuantConnect.DataSource
     /// The file is keyed by release date, not by reported quarter: a single release date carries
     /// filings for several quarters, because late filers and amendments keep arriving. Read
     /// PeriodEnd to know which quarter a record describes.
+    ///
+    /// Each business day carries every security's live quarters forward, not only the ones filed
+    /// that day. A quarter stops being carried once the next quarter's 45 day filing deadline has
+    /// passed, and a security leaves after its delisting date, so a name nobody reports any more
+    /// drops out rather than sitting in every file with its last quarter.
     /// </summary>
     [ProtoContract(SkipConstructor = true)]
     public class SEC13FHoldingsUniverse : BaseDataCollection
