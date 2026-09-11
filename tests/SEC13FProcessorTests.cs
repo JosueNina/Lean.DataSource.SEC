@@ -182,105 +182,114 @@ namespace QuantConnect.DataLibrary.Tests
         {
             // The rule was thousands, but not every filer followed it. In Apple's December 2019
             // quarter 85 of 5,365 lines were already in dollars, and multiplied by a thousand they
-            // made 88 percent of the total: an implied $2,577 a share against a $293.65 close.
+            // made 88 percent of the total: an implied $2,577 a share against a $293.65 close. Each
+            // line is held against the quarter-end close, which needs no other filer.
+            SeedCloses("20220930", ("aapl", 150m));
             var filing = new DateTime(2022, 11, 14);
             var quarter = new DateTime(2022, 9, 30);
             var holdings = ReadInfoTable(
                 new[]
                 {
                     Line("0000000000-00-000001", "037833100", "15", "100", "SH"),
-                    Line("0000000000-00-000002", "037833100", "15", "100", "SH"),
-                    Line("0000000000-00-000003", "037833100", "15", "100", "SH"),
-                    Line("0000000000-00-000004", "037833100", "15000", "100", "SH")
+                    Line("0000000000-00-000002", "037833100", "15000", "100", "SH")
                 },
+                resolve: true,
                 Submission("0000000000-00-000001", filing, quarter, cik: 111),
-                Submission("0000000000-00-000002", filing, quarter, cik: 222),
-                Submission("0000000000-00-000003", filing, quarter, cik: 333),
-                Submission("0000000000-00-000004", filing, quarter, cik: 444));
+                Submission("0000000000-00-000002", filing, quarter, cik: 222));
 
-            Assert.AreEqual(3 * 15000m + 15000m, holdings.Values.Single().HoldingValue,
-                "the three in thousands are scaled, the one already in dollars is not");
+            Assert.AreEqual(15000m + 15000m, holdings.Values.Single().HoldingValue,
+                "the one in thousands is scaled, the one already in dollars is not");
         }
 
         [Test]
         public void AFilerStillReportingThousandsAfter2023IsScaled()
         {
             // The same break from the other side: 548 of Apple's March 2026 lines were still in
-            // thousands, which left the published value five percent short.
+            // thousands, which left the published value five percent short. The quarter ends on a
+            // Sunday, so the close is the Friday's.
+            SeedCloses("20231229", ("aapl", 150m));
             var filing = new DateTime(2024, 2, 14);
             var quarter = new DateTime(2023, 12, 31);
             var holdings = ReadInfoTable(
                 new[]
                 {
                     Line("0000000000-00-000001", "037833100", "15000", "100", "SH"),
-                    Line("0000000000-00-000002", "037833100", "15000", "100", "SH"),
-                    Line("0000000000-00-000003", "037833100", "15000", "100", "SH"),
-                    Line("0000000000-00-000004", "037833100", "15", "100", "SH")
+                    Line("0000000000-00-000002", "037833100", "15", "100", "SH")
                 },
+                resolve: true,
                 Submission("0000000000-00-000001", filing, quarter, cik: 111),
-                Submission("0000000000-00-000002", filing, quarter, cik: 222),
-                Submission("0000000000-00-000003", filing, quarter, cik: 333),
-                Submission("0000000000-00-000004", filing, quarter, cik: 444));
+                Submission("0000000000-00-000002", filing, quarter, cik: 222));
 
-            Assert.AreEqual(4 * 15000m, holdings.Values.Single().HoldingValue);
+            Assert.AreEqual(2 * 15000m, holdings.Values.Single().HoldingValue);
+        }
+
+        [Test]
+        public void TheUnitIsDecidedWithoutLookingAtAnyOtherFiling()
+        {
+            // The unit used to come from the median of every filing in the three month window, so a
+            // filing made on its first day was corrected with filings made weeks later. Read alone,
+            // the way the daily job reads a day, the same filing comes out the same.
+            SeedCloses("20220930", ("aapl", 150m));
+            var filing = new DateTime(2022, 10, 3);
+            var quarter = new DateTime(2022, 9, 30);
+
+            var alone = ReadInfoTable(
+                new[] { Line("0000000000-00-000001", "037833100", "15000", "100", "SH") },
+                resolve: true,
+                Submission("0000000000-00-000001", filing, quarter, cik: 111));
+
+            Assert.AreEqual(15000m, alone.Values.Single().HoldingValue,
+                "a lone filing in dollars before 2023 is not multiplied by the thousands rule");
         }
 
         [Test]
         public void ALineInAnotherUnitThanTheRestOfItsFilingIsCorrectedOnItsOwn()
         {
             // Some filers mix units inside one filing, so a decision per filing left Apple's June 2020
-            // quarter 14 percent high: the filing is in thousands, its Apple line in dollars. With
-            // enough reports behind the median, the line is measured on its own.
+            // quarter 14 percent high: the filing is in thousands, its Apple line in dollars. Held
+            // against its own close, the line is measured on its own.
+            SeedCloses("20200630", ("aapl", 360m), ("msft", 200m), ("nvda", 400m));
             var filing = new DateTime(2020, 8, 14);
             var quarter = new DateTime(2020, 6, 30);
-            var lines = new List<string>();
-            var submissions = new List<KeyValuePair<string, SEC13FDownloader.Submission>>();
 
-            for (var filer = 1; filer <= 10; filer++)
-            {
-                var accession = $"0000000000-00-{filer:D6}";
-                lines.Add(Line(accession, "037833100", "36", "100", "SH"));
-                lines.Add(Line(accession, "594918104", "20", "100", "SH"));
-                lines.Add(Line(accession, "67066G104", "40", "100", "SH"));
-                submissions.Add(Submission(accession, filing, quarter, cik: filer));
-            }
+            var holdings = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000099", "037833100", "36000", "100", "SH"),
+                    Line("0000000000-00-000099", "594918104", "20", "100", "SH"),
+                    Line("0000000000-00-000099", "67066G104", "40", "100", "SH")
+                },
+                resolve: true,
+                Submission("0000000000-00-000099", filing, quarter, cik: 99));
 
-            // A filing in thousands like everyone else's, except for its Apple line.
-            lines.Add(Line("0000000000-00-000099", "037833100", "36000", "100", "SH"));
-            lines.Add(Line("0000000000-00-000099", "594918104", "20", "100", "SH"));
-            lines.Add(Line("0000000000-00-000099", "67066G104", "40", "100", "SH"));
-            submissions.Add(Submission("0000000000-00-000099", filing, quarter, cik: 99));
-
-            var holdings = ReadInfoTable(lines.ToArray(), submissions.ToArray());
-
-            Assert.AreEqual(11 * 36000m, holdings.Single(pair => pair.Key.Cusip == "037833100").Value.HoldingValue,
-                "the dollar line is not scaled a second time");
-            Assert.AreEqual(11 * 20000m, holdings.Single(pair => pair.Key.Cusip == "594918104").Value.HoldingValue,
+            Assert.AreEqual(36000m, holdings.Single(pair => pair.Key.Cusip == "037833100").Value.HoldingValue,
+                "the dollar line is not scaled");
+            Assert.AreEqual(20000m, holdings.Single(pair => pair.Key.Cusip == "594918104").Value.HoldingValue,
                 "and the rest of its filing still is");
         }
 
         [Test]
-        public void ALineAThousandTimesTheMedianIsBroughtDown()
+        public void ALineAThousandTimesTheCloseIsBroughtDown()
         {
             // Three SPY lines of the March 2023 quarter carried VALUE a thousand times the price, and 16
             // percent of the total with it. It is the VALUE that is off, not the share count: the same
             // filers reported the same number of shares the quarter before, as 4,578 of the 4,740
             // comparable lines of that quarter did.
+            SeedCloses("20230331", ("spy", 409.39m));
             var filing = new DateTime(2023, 5, 15);
             var quarter = new DateTime(2023, 3, 31);
-            var lines = new List<string>();
-            var submissions = new List<KeyValuePair<string, SEC13FDownloader.Submission>>();
 
-            for (var filer = 1; filer <= 11; filer++)
-            {
-                var accession = $"0000000000-00-{filer:D6}";
-                lines.Add(Line(accession, "78462F103", filer == 11 ? "40939000" : "40939", "100", "SH"));
-                submissions.Add(Submission(accession, filing, quarter, cik: filer));
-            }
+            var holdings = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000001", "78462F103", "40939", "100", "SH"),
+                    Line("0000000000-00-000002", "78462F103", "40939000", "100", "SH")
+                },
+                resolve: true,
+                Submission("0000000000-00-000001", filing, quarter, cik: 1),
+                Submission("0000000000-00-000002", filing, quarter, cik: 2));
 
-            var holdings = ReadInfoTable(lines.ToArray(), submissions.ToArray());
-
-            Assert.AreEqual(11 * 40939m, holdings.Values.Single().HoldingValue);
+            Assert.AreEqual(2 * 40939m, holdings.Values.Single().HoldingValue);
         }
 
         [Test]
@@ -309,37 +318,69 @@ namespace QuantConnect.DataLibrary.Tests
         [Test]
         public void ALineAMillionTimesOffIsLeftToItsFiling()
         {
-            // A price a thousand times below the median of a thousands filing would take a millionfold
+            // A price a thousand times below the close in a thousands filing would take a millionfold
             // factor. That is a wrong share count, not a unit, and scaling such lines put Apple's
             // December 2019 quarter ten percent above its close.
+            SeedCloses("20191231", ("aapl", 290m));
             var filing = new DateTime(2020, 2, 14);
             var quarter = new DateTime(2019, 12, 31);
-            var lines = new List<string>();
-            var submissions = new List<KeyValuePair<string, SEC13FDownloader.Submission>>();
 
-            for (var filer = 1; filer <= 11; filer++)
-            {
-                var accession = $"0000000000-00-{filer:D6}";
-                lines.Add(Line(accession, "037833100", "29", filer == 11 ? "100000" : "100", "SH"));
-                submissions.Add(Submission(accession, filing, quarter, cik: filer));
-            }
+            var holdings = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000001", "037833100", "29", "100", "SH"),
+                    Line("0000000000-00-000002", "037833100", "29", "100000", "SH")
+                },
+                resolve: true,
+                Submission("0000000000-00-000001", filing, quarter, cik: 1),
+                Submission("0000000000-00-000002", filing, quarter, cik: 2));
 
-            var holdings = ReadInfoTable(lines.ToArray(), submissions.ToArray());
-
-            Assert.AreEqual(11 * 29000m, holdings.Values.Single().HoldingValue,
+            Assert.AreEqual(2 * 29000m, holdings.Values.Single().HoldingValue,
                 "the odd line keeps the thousands factor of its filing");
         }
 
-        [TestCase(true, 1000, new double[0])]              // nothing to compare against: the rule stands
-        [TestCase(false, 1, new double[0])]
-        [TestCase(true, 1000, new[] { 0.1, -0.2, 0.0 })]   // prices in line with everybody else's
-        [TestCase(true, 1, new[] { 3.0, 2.9, 3.1, 0.2 })]  // a thousand times the median: dollars
-        [TestCase(false, 1, new[] { 0.1, -0.1 })]
-        [TestCase(false, 1000, new[] { -3.0, -2.8, 0.1 })] // a thousandth of the median: thousands
-        public void AFilingsUnitComesFromHowItsPricesCompareWithEveryoneElses(bool thousandsRule,
-            decimal expected, double[] offsets)
+        [TestCase(true, 1000, 0, new double[0])]                  // nothing to compare against: the rule stands
+        [TestCase(false, 1, 0, new double[0])]
+        [TestCase(true, 1000, 3, new[] { -3.0, -2.9, -3.1 })]     // thousands, as the rule says
+        [TestCase(true, 1, 4, new[] { 0.0, 0.1, -0.1, -3.0 })]    // whole dollars before 2023
+        [TestCase(false, 1, 2, new[] { 0.1, -0.1 })]
+        [TestCase(false, 1000, 3, new[] { -3.0, -2.8, 0.1 })]     // still thousands after 2023
+        [TestCase(false, 1, 10, new[] { -3.0, -2.9 })]            // two of ten priced lines on a step: no evidence
+        public void AFilingsUnitComesFromHowItsPricesCompareWithTheClose(bool thousandsRule,
+            decimal expected, int priced, double[] offsets)
         {
-            Assert.AreEqual(expected, SEC13FDownloader.ValueMultiplier(offsets.ToList(), thousandsRule));
+            Assert.AreEqual(expected, SEC13FDownloader.ValueMultiplier(offsets.ToList(), priced, thousandsRule));
+        }
+
+        [Test]
+        public void AFilingWithTheShareCountTypedAsValueIsNotScaled()
+        {
+            // A manager's 9 March 2026 filing carried SSHPRNAMT equal to VALUE on every line, a price of
+            // exactly $1. Against a close near $1,000 that reads as thousands, so the filing was taken to
+            // report in thousands and every one of its lines was multiplied: Dow's December 2025 quarter
+            // went from $12.6 billion to $50.2 billion. Most of its lines sit on no unit step, which is no
+            // evidence of a unit, and a line that sits on none keeps the rule of its filing date.
+            SeedCloses("20251231", ("aapl", 250m), ("msft", 480m), ("nvda", 180m), ("spy", 680m));
+            var filing = new DateTime(2026, 3, 9);
+            var quarter = new DateTime(2025, 12, 31);
+            var holdings = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000001", "037833100", "1000000", "1000000", "SH"),
+                    Line("0000000000-00-000001", "594918104", "500000", "500000", "SH"),
+                    Line("0000000000-00-000001", "67066G104", "300000", "300000", "SH"),
+                    Line("0000000000-00-000001", "78462F103", "200000", "200000", "SH")
+                },
+                resolve: true,
+                Submission("0000000000-00-000001", filing, quarter, cik: 1964189));
+
+            Assert.AreEqual(1000000m, holdings.Single(pair => pair.Key.Cusip == "037833100").Value.HoldingValue);
+            Assert.AreEqual(300000m, holdings.Single(pair => pair.Key.Cusip == "67066G104").Value.HoldingValue);
+
+            // MSFT at $480 and SPY at $680 put a $1 price on the thousands step by chance. In a filing
+            // whose lines mostly sit on no step those landings are not evidence either.
+            Assert.AreEqual(500000m, holdings.Single(pair => pair.Key.Cusip == "594918104").Value.HoldingValue);
+            Assert.AreEqual(200000m, holdings.Single(pair => pair.Key.Cusip == "78462F103").Value.HoldingValue);
         }
 
         [Test]
@@ -715,28 +756,99 @@ namespace QuantConnect.DataLibrary.Tests
             Assert.Throws<InvalidOperationException>(() => downloader.RequireEmptyDestination());
         }
 
+        // ---- Publication time and the EDGAR days ---------------------------------------------------
+
         [Test]
-        public void AnIncrementalRunReadsEveryArchivePublishedSinceTheLastRelease()
+        public void AFilingIsPublishedTheMorningAfterItsFilingDate()
         {
-            // The SEC publishes a window after it closes, so the nightly date is never covered and the
-            // run used to read only the newest archive. Two archives published while the job was down
-            // left the older one out for good. The last published universe day says where to resume.
-            var processed = Path.Combine(_root, "processed", SEC13FHoldings.ReportFolder, "universe");
-            Directory.CreateDirectory(processed);
-            File.WriteAllText(Path.Combine(processed, "20260529.csv"), string.Empty);
+            // The defect this dataset shipped with: a row stamped 17:30 on its filing date, when the
+            // SEC data sets publish that filing up to three months later. EDGAR lists a day's filings
+            // at about 22:05 ET and the daily job reads them at 01:00 the next day, so the row is
+            // published at 03:00 the morning after, and a backtest can read it no earlier.
+            using var downloader = Downloader();
 
+            Assert.AreEqual(new DateTime(2026, 5, 11, 3, 0, 0), downloader.ReleaseOf(new DateTime(2026, 5, 10)));
+        }
+
+        [Test]
+        public void ADayReadLateIsPublishedWhenTheRunReadIt()
+        {
+            // A daily run that picks up a day it missed, a late index or a failed night, could not
+            // have published that day before its own deployment date. Stamping the rows with the
+            // filing date would put them in the past, where live never delivered them.
             using var downloader = new SEC13FDownloader(
-                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 10));
+                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 9));
 
+            Assert.AreEqual(new DateTime(2026, 9, 10, 3, 0, 0), downloader.ReleaseOf(new DateTime(2026, 9, 3)),
+                "the missed day is stamped with the run that read it");
+            Assert.AreEqual(new DateTime(2026, 9, 10, 3, 0, 0), downloader.ReleaseOf(new DateTime(2026, 9, 9)),
+                "and the deployment date itself the usual way");
+        }
+
+        [Test]
+        public void TheRebuildHandsOverToEdgarTheDayAfterTheLastDataSet()
+        {
+            // The data sets come out in three month batches, so the rebuild reads them as far as they
+            // reach and EDGAR after that, the way the daily job does. EDGAR can also take over
+            // earlier, which is how the two sources are compared over a window both carry.
             var archives = new List<SEC13FDownloader.Archive>
             {
                 new("01dec2025-28feb2026_form13f.zip", "https://localhost/a.zip", new DateTime(2025, 12, 1), new DateTime(2026, 2, 28)),
-                new("01mar2026-31may2026_form13f.zip", "https://localhost/b.zip", new DateTime(2026, 3, 1), new DateTime(2026, 5, 31)),
-                new("01jun2026-31aug2026_form13f.zip", "https://localhost/c.zip", new DateTime(2026, 6, 1), new DateTime(2026, 8, 31))
+                new("01mar2026-31may2026_form13f.zip", "https://localhost/b.zip", new DateTime(2026, 3, 1), new DateTime(2026, 5, 31))
             };
 
-            Assert.AreEqual(new[] { "01mar2026-31may2026_form13f.zip", "01jun2026-31aug2026_form13f.zip" },
-                downloader.SelectArchives(archives).Select(archive => archive.Name).ToArray());
+            Assert.AreEqual(new[] { "01dec2025-28feb2026_form13f.zip", "01mar2026-31may2026_form13f.zip" },
+                SEC13FDownloader.ArchivesBefore(archives, new DateTime(2026, 6, 1)).Select(archive => archive.Name).ToArray());
+            Assert.AreEqual(new[] { "01dec2025-28feb2026_form13f.zip" },
+                SEC13FDownloader.ArchivesBefore(archives, new DateTime(2026, 3, 1)).Select(archive => archive.Name).ToArray());
+        }
+
+        [Test]
+        public void EdgarCannotTakeOverInTheMiddleOfADataSet()
+        {
+            // The window's filings before the switch would come from the data set and the rest from
+            // EDGAR only if the archive were cut by date, which it is not: it would be read twice.
+            var archives = new List<SEC13FDownloader.Archive>
+            {
+                new("01mar2026-31may2026_form13f.zip", "https://localhost/b.zip", new DateTime(2026, 3, 1), new DateTime(2026, 5, 31))
+            };
+
+            Assert.Throws<InvalidOperationException>(() => SEC13FDownloader.ArchivesBefore(archives, new DateTime(2026, 4, 15)));
+        }
+
+        [Test]
+        public void ADailyRunReadsTheWeekdaysNoEarlierRunFoldedIn()
+        {
+            // A day already published is never read again, since its filings would be added a second
+            // time under a later stamp, and a day without an index is tried again by the next run.
+            // Nor is a day before EDGAR took over from the data sets: the rebuild read those from the
+            // data set, so they are not in the list, and reading them from EDGAR counted them twice.
+            var shelf = ShelfWithFilerState();
+            File.WriteAllText(Path.Combine(shelf, "edgar-days.txt"), "#from 20260901\n20260903\n20260904\n");
+
+            using var downloader = new SEC13FDownloader(
+                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 9));
+            downloader.ReadEdgarState();
+
+            Assert.AreEqual(
+                new[] { "20260901", "20260902", "20260907", "20260908", "20260909" },
+                downloader.EdgarDaysToRead(new DateTime(2026, 8, 30), new DateTime(2026, 9, 9))
+                    .Select(day => day.ToString("yyyyMMdd")).ToArray());
+        }
+
+        [Test]
+        public void AnIncrementalRunWithoutTheEdgarStateFails()
+        {
+            // Without the list of days already published a run cannot tell a new day from one it
+            // would add a second time, so it stops instead of guessing.
+            var shelf = ShelfWithFilerState();
+            File.Delete(Path.Combine(shelf, "edgar-days.txt"));
+            File.WriteAllLines(Path.Combine(shelf, "aapl.csv"), new[] { "20240215 03:00,20231231,1,5,50,0,0,0,0,0,0" });
+
+            using var downloader = new SEC13FDownloader(
+                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 9));
+
+            Assert.Throws<InvalidOperationException>(() => downloader.RequirePublishedHistoryForIncrementalRun());
         }
 
         [Test]
@@ -855,81 +967,6 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
-        public void ReadingAnArchiveAgainCountsItsFilersAgainRatherThanPublishingZero()
-        {
-            // The defect this exists for, caught by running the incremental path end to end: the
-            // rolling window covers three months and the job reads it every night, so on the second
-            // night every filer of that window is already in the state, each of its days publishes
-            // an increment of zero, and the merge lets the fresh reading win. Apple's March 2026
-            // quarter went from 6,041 holders to 0 in one run, with the file the right shape and
-            // only that column moved.
-            var security = Security("AAPL");
-            var quarter = new DateTime(2023, 12, 31);
-            var filed = new DateTime(2024, 2, 14);
-
-            using (var first = Downloader())
-            {
-                first.CountNewFilers(security, quarter, new[] { 111, 222, 333 }, filed);
-                first.WriteFilerState();
-            }
-
-            var shelf = Path.Combine(_root, "processed", SEC13FHoldings.ReportFolder);
-            Directory.CreateDirectory(shelf);
-            File.Copy(
-                Path.Combine(_root, "out", SEC13FHoldings.ReportFolder, "filers.zip"),
-                Path.Combine(shelf, "filers.zip"), overwrite: true);
-
-            using var second = new SEC13FDownloader(
-                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), filed);
-            second.ReadFilerState();
-            second.PruneFilerState(new List<SEC13FDownloader.Archive>
-            {
-                new("01jan2024-31mar2024_form13f.zip", "https://localhost/x.zip",
-                    new DateTime(2024, 1, 1), new DateTime(2024, 3, 31))
-            });
-
-            Assert.AreEqual(3, second.CountNewFilers(security, quarter, new[] { 111, 222, 333 }, filed),
-                "reading the same window again has to reproduce the same increment");
-        }
-
-        [Test]
-        public void AFilerCountedBeforeTheWindowSurvivesThePrune()
-        {
-            // The other half of the rule. Only the filers first counted inside the window being read
-            // again are forgotten; one counted in an earlier window stays known, or reading tonight's
-            // archive would count it a second time and push the quarter above its real number.
-            var security = Security("AAPL");
-            var quarter = new DateTime(2023, 12, 31);
-
-            using (var first = Downloader())
-            {
-                first.CountNewFilers(security, quarter, new[] { 111 }, new DateTime(2023, 11, 15));
-                first.CountNewFilers(security, quarter, new[] { 222 }, new DateTime(2024, 2, 14));
-                first.WriteFilerState();
-            }
-
-            var shelf = Path.Combine(_root, "processed", SEC13FHoldings.ReportFolder);
-            Directory.CreateDirectory(shelf);
-            File.Copy(
-                Path.Combine(_root, "out", SEC13FHoldings.ReportFolder, "filers.zip"),
-                Path.Combine(shelf, "filers.zip"), overwrite: true);
-
-            using var second = new SEC13FDownloader(
-                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2024, 2, 14));
-            second.ReadFilerState();
-            second.PruneFilerState(new List<SEC13FDownloader.Archive>
-            {
-                new("01jan2024-31mar2024_form13f.zip", "https://localhost/x.zip",
-                    new DateTime(2024, 1, 1), new DateTime(2024, 3, 31))
-            });
-
-            Assert.AreEqual(0, second.CountNewFilers(security, quarter, new[] { 111 }, new DateTime(2024, 2, 20)),
-                "the filer counted in November is outside the window and stays counted");
-            Assert.AreEqual(1, second.CountNewFilers(security, quarter, new[] { 222 }, new DateTime(2024, 2, 14)),
-                "the filer counted inside the window is recounted");
-        }
-
-        [Test]
         public void TheFilerStateIsByteReproducible()
         {
             // The state ships with the data, so a run that read no new filing has to produce the
@@ -1018,6 +1055,7 @@ namespace QuantConnect.DataLibrary.Tests
             File.Copy(
                 Path.Combine(_root, "out", SEC13FHoldings.ReportFolder, "filers.zip"),
                 Path.Combine(shelf, "filers.zip"), overwrite: true);
+            File.WriteAllText(Path.Combine(shelf, "edgar-days.txt"), "#from 20260601\n20260601\n");
             return shelf;
         }
 
@@ -1295,6 +1333,204 @@ namespace QuantConnect.DataLibrary.Tests
             Assert.AreEqual("META", newerFirst["30303M102"].Ticker);
         }
 
+        // ---- Crosswalk resolutions are held against the close --------------------------------------
+
+        [Test]
+        public void ACrosswalkGroupStaysUnlessItsPricesSayItIsAnotherSecurity()
+        {
+            // The crosswalk is a fund administrator's ticker, so a CUSIP can reach the wrong company.
+            // The group's own prices against the quarter-end close decide, on the day it is read.
+            SeedCloses("20251231", ("etsy", 120m), ("defi", 129.50m), ("aapl", 250m), ("spy", 24.23m));
+            using var downloader = Downloader();
+            var period = new DateTime(2025, 12, 31);
+            var filed = new DateTime(2026, 2, 14);
+            bool Keeps(string cusip, string ticker, params double[] prices) =>
+                downloader.KeepsCrosswalkGroup(cusip, ListedSince1980(ticker), period, filed, prices.ToList());
+
+            // Etsy's convertible notes reached Etsy's stock: 171 million of its 298 million shares.
+            Assert.IsFalse(Keeps("29786AAJ5", "ETSY"), "a note reported as principal carries no price");
+            Assert.IsFalse(Keeps("29786AAJ5", "ETSY", 1.02, 0.98), "a note reported as shares trades near par");
+            Assert.IsTrue(Keeps("46435GAA0", "SPY", 24.23, 24.20),
+                "a CUSIP with letters that trades at the security's own price, as the iBonds ETFs do, stays");
+
+            // DeFi Technologies at $2 reached the $129.50 Hashdex DEFI ETF through its ticker.
+            Assert.IsFalse(Keeps("244916102", "DEFI", 2.11, 2.05, 2.11), "three managers at $2 are another company");
+            Assert.IsTrue(Keeps("037833100", "AAPL", 25.0), "one manager's odd price is a slip, not another company");
+            Assert.IsTrue(Keeps("037833100", "AAPL", 0.25, 0.25, 250.1), "the same prices in thousands match");
+            Assert.IsTrue(Keeps("037833100", "AAPL"), "a day of option lines only cannot be checked and stays");
+            Assert.IsTrue(Keeps("594918104", "MSFT", 2.0, 2.0, 2.0), "nor can a security the close file does not carry");
+
+            // Avanos on 5 February 2026: four managers in thousands and four in dollars. Their median
+            // sat half way between the two units and dropped the group.
+            Assert.IsTrue(Keeps("037833100", "AAPL", 0.25, 0.25, 0.25, 0.25, 250.0, 250.1, 249.9, 740.8),
+                "a day that mixes the two units is still the security");
+        }
+
+        [Test]
+        public void ALineThatSitsOnNoUnitStepIsNotScaled()
+        {
+            // A price about a hundred times below the close is neither dollars nor thousands: a bond at
+            // par against its issuer's stock, or another company. Scaling it by the nearest step put
+            // Seagate's December 2025 quarter at $413 billion.
+            SeedCloses("20251231", ("aapl", 250m));
+            var filing = new DateTime(2026, 2, 14);
+            var quarter = new DateTime(2025, 12, 31);
+            var holdings = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000001", "037833100", "250000", "1000", "SH"),
+                    Line("0000000000-00-000002", "037833100", "2500", "1000", "SH")
+                },
+                resolve: true,
+                Submission("0000000000-00-000001", filing, quarter, cik: 1),
+                Submission("0000000000-00-000002", filing, quarter, cik: 2));
+
+            Assert.AreEqual(250000m + 2500m, holdings.Values.Single().HoldingValue,
+                "the $2.50 line keeps its filing's dollar factor instead of becoming $2.5 million");
+        }
+
+        [TestCase(0.0, 0)]
+        [TestCase(-3.0, -1)]
+        [TestCase(3.1, 1)]
+        [TestCase(-2.9, -1)]
+        public void AnOffsetNearAThousandfoldStepIsAUnit(double offset, int step)
+        {
+            Assert.AreEqual(step, SEC13FDownloader.UnitStep(offset));
+        }
+
+        [TestCase(-1.5)]    // half way between dollars and thousands
+        [TestCase(-2.0)]    // a hundred times below: a bond at par against a stock
+        [TestCase(1.79)]
+        [TestCase(-6.0)]    // a millionfold step is a share count slip, not a unit
+        public void AnOffsetOnNoStepIsNoUnit(double offset)
+        {
+            Assert.IsNull(SEC13FDownloader.UnitStep(offset));
+        }
+
+        [Test]
+        public void TheCloseIsNeverReadAfterTheFilingDate()
+        {
+            // A period typed ahead of its filing date would otherwise read a price nobody had when
+            // the filing was made. The quarter ends on a Tuesday; filed the Sunday before, the
+            // Friday's close is the newest one there was.
+            SeedCloses("20260327", ("aapl", 250m));
+            var coarse = Path.Combine(_root, "data", "equity", "usa", "fundamental", "coarse");
+            File.WriteAllText(Path.Combine(coarse, "20260331.csv"), $"{ListedSince1980("AAPL")},AAPL,999,1,1,True,1,1\n");
+            var prices = new SEC13FClosePrices(coarse);
+
+            Assert.AreEqual(250m, prices.Close(ListedSince1980("AAPL"), new DateTime(2026, 3, 31), new DateTime(2026, 3, 29)));
+            Assert.AreEqual(999m, prices.Close(ListedSince1980("AAPL"), new DateTime(2026, 3, 31), new DateTime(2026, 4, 2)));
+        }
+
+        // ---- Reading a day from EDGAR ---------------------------------------------------------------
+
+        [Test]
+        public void TheDailyIndexYieldsTheHoldingsReportsAndTheirAmendmentsOnly()
+        {
+            // Notices carry no information table and the data sets' reader skips them too.
+            var index = string.Join("\n",
+                "Form Type   Company Name   CIK   Date Filed  File Name",
+                "---------------------------------------------------------",
+                "10-K             SOMETHING ELSE INC          1111111     20260814    edgar/data/1111111/0001111111-26-000001.txt",
+                "13F-HR           &PARTNERS                   107136      20260814    edgar/data/107136/0001214659-26-010148.txt",
+                "13F-HR/A         FUND 1 ADVISERS LLC         2222222     20260814    edgar/data/2222222/0002222222-26-000003.txt",
+                "13F-NT           NOTICE FILER LP             3333333     20260814    edgar/data/3333333/0003333333-26-000004.txt");
+
+            var entries = SEC13FEdgarDay.ParseIndex(index);
+
+            Assert.AreEqual(new[] { "0001214659-26-010148", "0002222222-26-000003" },
+                entries.Select(entry => entry.Accession).ToArray());
+            Assert.AreEqual(new[] { "13F-HR", "13F-HR/A" }, entries.Select(entry => entry.FormType).ToArray());
+            Assert.AreEqual(new[] { 107136, 2222222 }, entries.Select(entry => entry.Cik).ToArray());
+            Assert.AreEqual(new DateTime(2026, 8, 14), entries[0].Filed);
+        }
+
+        [Test]
+        public void AFilingIsReadFromItsSubmissionFile()
+        {
+            // The period and the confidential flag come from the primary document, the lines from the
+            // information table, whatever namespace the filer's software wrote.
+            var filing = SEC13FEdgarDay.ParseFiling(SampleEntry(), SampleSubmission());
+
+            Assert.AreEqual("0001214659-26-010148", filing.Accession);
+            Assert.AreEqual(new DateTime(2026, 6, 30), filing.Period);
+            Assert.IsTrue(filing.ConfidentialOmitted);
+            Assert.AreEqual(2, filing.Lines.Count);
+            Assert.AreEqual(new[] { "88025U109", "274974", "7172", "SH", null, "7172", "0" }, filing.Lines[0]);
+            Assert.AreEqual("Put", filing.Lines[1][4]);
+        }
+
+        [Test]
+        public void ADaysArchiveCarriesTheTablesTheProcessorReads()
+        {
+            // The day is written in the data sets' own layout so the rest of the processor reads it
+            // like a window, which is what makes EDGAR and the data sets give the same rows.
+            var filing = SEC13FEdgarDay.ParseFiling(SampleEntry(), SampleSubmission());
+
+            using var buffer = new MemoryStream();
+            SEC13FEdgarDay.WriteArchive(buffer, new[] { filing });
+            buffer.Position = 0;
+            using var zip = new ZipArchive(buffer, ZipArchiveMode.Read);
+
+            var submission = SEC13FFiles.ReadTable(zip, "edgar", "SUBMISSION.tsv", false,
+                "ACCESSION_NUMBER", "FILING_DATE", "SUBMISSIONTYPE", "CIK", "PERIODOFREPORT").Single();
+            Assert.AreEqual("2026-08-14", submission.Fields[submission.Columns["FILING_DATE"]]);
+            Assert.AreEqual("2026-06-30", submission.Fields[submission.Columns["PERIODOFREPORT"]]);
+
+            var summary = SEC13FFiles.ReadTable(zip, "edgar", "SUMMARYPAGE.tsv", false,
+                "ACCESSION_NUMBER", "ISCONFIDENTIALOMITTED").Single();
+            Assert.AreEqual("Y", summary.Fields[summary.Columns["ISCONFIDENTIALOMITTED"]]);
+
+            var lines = SEC13FFiles.ReadTable(zip, "edgar", "INFOTABLE.tsv", false,
+                "ACCESSION_NUMBER", "CUSIP", "VALUE", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL",
+                "VOTING_AUTH_SOLE", "VOTING_AUTH_SHARED").ToList();
+            Assert.AreEqual(2, lines.Count);
+            Assert.AreEqual("037833100", lines[1].Fields[lines[1].Columns["CUSIP"]]);
+            Assert.AreEqual("Put", lines[1].Fields[lines[1].Columns["PUTCALL"]]);
+        }
+
+        private static SEC13FEdgarDay.IndexEntry SampleEntry()
+        {
+            return new SEC13FEdgarDay.IndexEntry("13F-HR", 107136, new DateTime(2026, 8, 14),
+                "edgar/data/107136/0001214659-26-010148.txt");
+        }
+
+        /// <summary>A full submission file cut down to the two documents the reader uses.</summary>
+        private static string SampleSubmission()
+        {
+            return string.Join("\n",
+                "<SEC-DOCUMENT>0001214659-26-010148.txt : 20260814",
+                "<DOCUMENT>",
+                "<TYPE>13F-HR",
+                "<TEXT>",
+                "<XML>",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<edgarSubmission xmlns=\"http://www.sec.gov/edgar/thirteenffiler\"><headerData>" +
+                "<submissionType>13F-HR</submissionType><filerInfo><periodOfReport>06-30-2026</periodOfReport>" +
+                "</filerInfo></headerData><formData><summaryPage><isConfidentialOmitted>true</isConfidentialOmitted>" +
+                "</summaryPage></formData></edgarSubmission>",
+                "</XML>",
+                "</TEXT>",
+                "</DOCUMENT>",
+                "<DOCUMENT>",
+                "<TYPE>INFORMATION TABLE",
+                "<TEXT>",
+                "<XML>",
+                "<ns1:informationTable xmlns:ns1=\"http://www.sec.gov/edgar/document/thirteenf/informationtable\">" +
+                "<ns1:infoTable><ns1:cusip>88025U109</ns1:cusip><ns1:value>274974</ns1:value><ns1:shrsOrPrnAmt>" +
+                "<ns1:sshPrnamt>7172</ns1:sshPrnamt><ns1:sshPrnamtType>SH</ns1:sshPrnamtType></ns1:shrsOrPrnAmt>" +
+                "<ns1:votingAuthority><ns1:Sole>7172</ns1:Sole><ns1:Shared>0</ns1:Shared><ns1:None>0</ns1:None>" +
+                "</ns1:votingAuthority></ns1:infoTable>" +
+                "<ns1:infoTable><ns1:cusip>037833100</ns1:cusip><ns1:value>1000</ns1:value><ns1:shrsOrPrnAmt>" +
+                "<ns1:sshPrnamt>50</ns1:sshPrnamt><ns1:sshPrnamtType>SH</ns1:sshPrnamtType></ns1:shrsOrPrnAmt>" +
+                "<ns1:putCall>Put</ns1:putCall><ns1:votingAuthority><ns1:Sole>0</ns1:Sole><ns1:Shared>50</ns1:Shared>" +
+                "<ns1:None>0</ns1:None></ns1:votingAuthority></ns1:infoTable></ns1:informationTable>",
+                "</XML>",
+                "</TEXT>",
+                "</DOCUMENT>",
+                "</SEC-DOCUMENT>");
+        }
+
         // ---- Fixtures -----------------------------------------------------------------------------
 
         /// <summary>One increment or cumulative row. Only the first two measures are exercised.</summary>
@@ -1339,6 +1575,17 @@ namespace QuantConnect.DataLibrary.Tests
         private Dictionary<SEC13FDownloader.HoldingKey, SEC13FDownloader.Holding> ReadInfoTable(
             string[] lines, params KeyValuePair<string, SEC13FDownloader.Submission>[] submissions)
         {
+            return ReadInfoTable(lines, false, submissions);
+        }
+
+        /// <summary>
+        /// The same reader, with the four CUSIPs the unit tests use resolvable through the crosswalk
+        /// when <paramref name="resolve"/> is set, so their lines are held against the closes
+        /// SeedCloses wrote. Unset, no CUSIP resolves and every line falls back to its filing's rule.
+        /// </summary>
+        private Dictionary<SEC13FDownloader.HoldingKey, SEC13FDownloader.Holding> ReadInfoTable(
+            string[] lines, bool resolve, params KeyValuePair<string, SEC13FDownloader.Submission>[] submissions)
+        {
             var text = new StringBuilder()
                 .AppendLine(string.Join('\t', "ACCESSION_NUMBER", "CUSIP", "VALUE", "SSHPRNAMT",
                     "SSHPRNAMTTYPE", "PUTCALL", "VOTING_AUTH_SOLE", "VOTING_AUTH_SHARED"));
@@ -1358,12 +1605,49 @@ namespace QuantConnect.DataLibrary.Tests
             buffer.Position = 0;
             using var archive = new ZipArchive(buffer, ZipArchiveMode.Read);
             using var downloader = Downloader();
+            downloader.TickerCrosswalk = resolve
+                ? UnitTestCrosswalk()
+                : new Dictionary<string, SEC13FTickerCrosswalk.Entry>();
 
             return downloader.ReadInfoTable(
                 archive,
                 new SEC13FDownloader.Archive("2024q1_form13f.zip", "https://localhost/2024q1_form13f.zip",
                     new DateTime(2024, 1, 1), new DateTime(2024, 3, 31)),
                 submissions.ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.Ordinal));
+        }
+
+        /// <summary>The CUSIPs the unit tests name, to the tickers SeedCloses lists.</summary>
+        private static Dictionary<string, SEC13FTickerCrosswalk.Entry> UnitTestCrosswalk()
+        {
+            var observed = new DateTime(2026, 1, 1);
+            return new Dictionary<string, SEC13FTickerCrosswalk.Entry>
+            {
+                ["037833100"] = new("AAPL", observed),
+                ["594918104"] = new("MSFT", observed),
+                ["67066G104"] = new("NVDA", observed),
+                ["78462F103"] = new("SPY", observed)
+            };
+        }
+
+        /// <summary>
+        /// Writes one trading day's coarse file with these closes, and map files listing the tickers
+        /// over every date used, so a crosswalk CUSIP resolves to the identifier the file is keyed by.
+        /// </summary>
+        private void SeedCloses(string day, params (string Ticker, decimal Close)[] closes)
+        {
+            SeedMapFiles("aapl", "msft", "nvda", "spy", "defi", "etsy");
+
+            var coarse = Path.Combine(_root, "data", "equity", "usa", "fundamental", "coarse");
+            Directory.CreateDirectory(coarse);
+            File.WriteAllLines(Path.Combine(coarse, $"{day}.csv"), closes.Select(pair =>
+                $"{ListedSince1980(pair.Ticker)},{pair.Ticker.ToUpperInvariant()}," +
+                $"{pair.Close.ToString(System.Globalization.CultureInfo.InvariantCulture)},100,1000,True,1,1"));
+        }
+
+        /// <summary>The identifier SeedMapFiles gives a ticker: listed on its first row, 1980-12-12.</summary>
+        private static SecurityIdentifier ListedSince1980(string ticker)
+        {
+            return SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), ticker.ToUpperInvariant(), Market.USA);
         }
 
         /// <summary>

@@ -86,6 +86,10 @@ namespace QuantConnect.DataProcessing
 
             if (missing.Count == 0)
             {
+                // Written back all the same, so the published folder always carries the map the data was
+                // built with. A run that found it complete used to leave it out of its output, and the
+                // next daily run rebuilt it from 1.8 GB of N-PORT, possibly with a newer quarter.
+                WriteCache(Path.Combine(writeDirectory, CacheFileName), cached, cachedQuarters);
                 Log.Trace($"SEC13FTickerCrosswalk.Load(): cache holds {cached.Count} CUSIPs, nothing to fetch");
                 return cached;
             }

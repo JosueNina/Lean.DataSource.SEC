@@ -70,9 +70,31 @@ namespace QuantConnect.DataProcessing
         // restatement's corrections to a position already counted are not applied; see AdmitAmendment.
         private const string AmendmentSubmissionTypeSuffix = "/A";
 
-        // EDGAR stops accepting same-day filings at 17:30 ET, so a filing is public by then on its
-        // FILING_DATE and the point can never be read before it existed.
-        private static readonly TimeSpan ReleaseTimeOfDay = new(17, 30, 0);
+        // EDGAR lists a day's filings in its daily index at about 22:05 ET (02:02 to 02:07 UTC the
+        // next morning over six business days measured in September 2026). The daily job reads that
+        // index at 01:00 ET the next day with a one hour timeout (schedule "0 1 * * 2-6", Date
+        // Offset 1), so a filing is published the day after its FILING_DATE at ReleaseTimeOfDay.
+        // Stamping it any earlier would let a backtest read it before the live job had it.
+        internal static readonly TimeSpan AvailableAfterFilingDate = TimeSpan.FromDays(1) + SEC13FHoldings.ReleaseTimeOfDay;
+
+        /// <summary>Config key that starts the rebuild's EDGAR days on this yyyyMMdd instead of after the last data set.</summary>
+        internal const string EdgarFromKey = "sec-13f-edgar-from";
+
+        /// <summary>Config key that ends the rebuild's EDGAR days on this yyyyMMdd instead of yesterday.</summary>
+        internal const string EdgarUntilKey = "sec-13f-edgar-until";
+
+        /// <summary>
+        /// Config key that makes the rebuild skip the data sets ending before this yyyyMMdd. For checks
+        /// only: the rules do not depend on the old years, and cutting them takes a rebuild from ten
+        /// minutes to one or two. A published history always starts in 2013.
+        /// </summary>
+        internal const string RebuildFromKey = "sec-13f-rebuild-from";
+
+        /// <summary>The EDGAR days already folded into the published history, one yyyyMMdd per line.</summary>
+        private const string EdgarStateFileName = "edgar-days.txt";
+
+        /// <summary>How far back a daily run looks for a day whose index EDGAR published late.</summary>
+        private const int EdgarLookbackDays = 10;
 
         private const string ReleaseFormat = "yyyyMMdd HH:mm";
         private const string PeriodFormat = "yyyyMMdd";
@@ -88,15 +110,14 @@ namespace QuantConnect.DataProcessing
         /// <summary>Days after a quarter end that managers have to file their 13F for it.</summary>
         private const int FilingDeadlineDays = 45;
 
-        /// <summary>Reports of one security and quarter needed before their median price is a reference.</summary>
-        private const int MinimumReportsForMedianPrice = 3;
-
-        /// <summary>Reports needed before the median can correct a single line on its own.</summary>
-        private const int MinimumReportsForLineCorrection = 10;
-
         // The SEC rule: VALUE in thousands for filings before this date, whole dollars from it.
         // DetectValueUnits checks each filing against it.
         private static readonly DateTime ValueInWholeDollarsFrom = new(2023, 1, 1);
+
+        // How far, in log10, a crosswalk group's median price may sit from the close times a power
+        // of a thousand and still be that security: about three times either way. Farther is another
+        // security, as DeFi Technologies at $2 reaching the $129 Hashdex DEFI ETF through its ticker.
+        private const double PriceMatchTolerance = 0.5;
 
         private static readonly string[] SecDateFormats = { "dd-MMM-yyyy", "d-MMM-yyyy", "yyyy-MM-dd", "MM/dd/yyyy" };
 
@@ -204,11 +225,31 @@ namespace QuantConnect.DataProcessing
         private readonly HashSet<string> _unresolvedCusips = new(StringComparer.Ordinal);
 
         /// <summary>
+        /// CUSIPs and filing dates resolved through the crosswalk rather than the security database,
+        /// cleared with the resolution cache. Their groups are checked against the close, since a fund
+        /// administrator's ticker can name another company.
+        /// </summary>
+        private readonly HashSet<(string Cusip, DateTime Date)> _crosswalkResolutions = new();
+
+        private long _debtCusipsRejected;
+        private long _mismatchedGroups;
+        private decimal _mismatchedValue;
+
+        /// <summary>The quarter-end closes that decide VALUE's unit and vet crosswalk resolutions.</summary>
+        private readonly SEC13FClosePrices _closePrices;
+
+        /// <summary>EDGAR days already folded into the history, published so a daily run never reads one twice.</summary>
+        private readonly SortedSet<DateTime> _edgarDays = new();
+
+        private readonly DateTime? _edgarFrom;
+        private readonly DateTime? _edgarUntil;
+
+        /// <summary>
         /// Creates a new instance writing to <paramref name="destinationDirectory"/>, merging with any
         /// previously processed data found in <paramref name="processedDataDirectory"/>. A null
-        /// <paramref name="deploymentDate"/> walks every published archive; a date reads only the
-        /// archive whose window covers it. Downloads are kept under
-        /// <paramref name="rawDataDirectory"/> so the next run finds them.
+        /// <paramref name="deploymentDate"/> rebuilds the history from the data sets and EDGAR; a date
+        /// reads that day's filings from EDGAR, with any recent day it has not read yet. Downloads are
+        /// kept under <paramref name="rawDataDirectory"/> so the next run finds them.
         /// </summary>
         public SEC13FDownloader(string destinationDirectory, string processedDataDirectory, DateTime? deploymentDate,
             string rawDataDirectory = null)
@@ -248,6 +289,33 @@ namespace QuantConnect.DataProcessing
                 Log.Error($"SEC13FDownloader(): {securityDatabasePath} is missing. It is not distributable, " +
                           "and without it no CUSIP or ISIN resolves and the run produces no data.");
             }
+
+            _closePrices = new SEC13FClosePrices(Path.Combine(Globals.DataFolder, "equity", "usa", "fundamental", "coarse"));
+            if (!_closePrices.Available)
+            {
+                Log.Error("SEC13FDownloader(): the coarse universe files are missing from the data folder. Without the " +
+                          "quarter-end closes VALUE falls back to the SEC unit rule and every crosswalk resolution is dropped.");
+            }
+
+            _edgarFrom = ParseOptionalDate(Config.Get(EdgarFromKey), EdgarFromKey);
+            _edgarUntil = ParseOptionalDate(Config.Get(EdgarUntilKey), EdgarUntilKey);
+        }
+
+        /// <summary>A yyyyMMdd config value, or null when the key is not set.</summary>
+        private static DateTime? ParseOptionalDate(string value, string key)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return null;
+            }
+
+            if (DateTime.TryParseExact(value.Trim(), DateFormat.EightCharacter, CultureInfo.InvariantCulture,
+                    DateTimeStyles.None, out var date))
+            {
+                return date;
+            }
+
+            throw new ArgumentException($"SEC13FDownloader(): {key} '{value}' is not yyyyMMdd");
         }
 
         /// <summary>
@@ -259,27 +327,121 @@ namespace QuantConnect.DataProcessing
             RequireEmptyDestination();
             RequirePublishedHistoryForIncrementalRun();
             ReadFilerState();
+            ReadEdgarState();
 
-            var archives = GetArchives();
-            Log.Trace($"SEC13FDownloader.Run(): {archives.Count} archives published, " +
-                      $"{archives[0].Start:yyyy-MM-dd}..{archives[archives.Count - 1].End:yyyy-MM-dd}");
-
-            var selected = SelectArchives(archives);
-            Log.Trace($"SEC13FDownloader.Run(): processing {selected.Count} archive(s): " +
-                      $"{string.Join(", ", selected.Select(x => x.Name))}");
-
-            PruneFilerState(selected);
-
-            foreach (var archive in selected)
+            if (_deploymentDate == null)
             {
-                ProcessArchive(archive);
-                FlushPendingRows();
+                // The data sets as far as they reach, then EDGAR day by day: the filings the daily
+                // job reads, with the stamps it gives them.
+                var archives = GetArchives();
+                var edgarFrom = _edgarFrom ?? archives[archives.Count - 1].End.AddDays(1);
+                var rebuildFrom = ParseOptionalDate(Config.Get(RebuildFromKey), RebuildFromKey);
+                var selected = ArchivesBefore(archives, edgarFrom)
+                    .Where(archive => rebuildFrom == null || archive.End >= rebuildFrom)
+                    .ToList();
+                _edgarFirstDay = edgarFrom;
+                Log.Trace($"SEC13FDownloader.Run(): {archives.Count} archives published, processing {selected.Count} " +
+                          $"through {selected.LastOrDefault()?.End:yyyy-MM-dd}, then EDGAR from {edgarFrom:yyyy-MM-dd}");
+
+                foreach (var archive in selected)
+                {
+                    ProcessArchive(archive);
+                    FlushPendingRows();
+                }
+
+                ProcessEdgarDays(EdgarDaysToRead(edgarFrom, _edgarUntil ?? YesterdayInNewYork()));
+            }
+            else
+            {
+                // The deployment date, and any recent day whose index EDGAR published late.
+                ProcessEdgarDays(EdgarDaysToRead(_deploymentDate.Value.AddDays(-EdgarLookbackDays), _deploymentDate.Value));
             }
 
             FinalizeSecurityFiles();
             BuildUniverseFiles();
             WriteFilerState();
+            WriteEdgarState();
             LogResolutionSummary();
+        }
+
+        /// <summary>
+        /// Reads each day's filings from EDGAR and folds them in like an archive. A weekday without an
+        /// index is a holiday or a late index; it is not recorded, so a later run can still read it.
+        /// </summary>
+        private void ProcessEdgarDays(List<DateTime> days)
+        {
+            var read = 0;
+            foreach (var day in days)
+            {
+                var path = SEC13FEdgarDay.Build(day, _archiveCacheDirectory, TryGetText);
+                if (path == null)
+                {
+                    Log.Trace($"SEC13FDownloader.ProcessEdgarDays(): EDGAR has no index for {day:yyyy-MM-dd}");
+                    continue;
+                }
+
+                ProcessArchive(new Archive(Path.GetFileName(path), SEC13FEdgarDay.IndexUrl(day), day, day, IsDaily: true));
+                FlushPendingRows();
+                _edgarDays.Add(day);
+                read++;
+            }
+
+            Log.Trace($"SEC13FDownloader.ProcessEdgarDays(): read {read} of {days.Count} EDGAR days");
+        }
+
+        /// <summary>
+        /// The data sets whose window ends before EDGAR takes over. A window that straddles the switch
+        /// would have its filings read from both sources or from neither, so it stops the run.
+        /// </summary>
+        internal static List<Archive> ArchivesBefore(List<Archive> archives, DateTime edgarFrom)
+        {
+            var straddling = archives.FirstOrDefault(archive => archive.Start < edgarFrom && archive.End >= edgarFrom);
+            if (straddling != null)
+            {
+                throw new InvalidOperationException(
+                    $"SEC13FDownloader.ArchivesBefore(): {straddling.Name} covers {edgarFrom:yyyy-MM-dd}. EDGAR has to " +
+                    "take over the day after a data set ends, or that window would be read twice or not at all.");
+            }
+
+            return archives.Where(archive => archive.End < edgarFrom).ToList();
+        }
+
+        /// <summary>
+        /// The weekdays from one date to another that no earlier run has folded in, never before the
+        /// day EDGAR took over from the data sets.
+        /// </summary>
+        internal List<DateTime> EdgarDaysToRead(DateTime from, DateTime until)
+        {
+            var days = new List<DateTime>();
+            var first = from.Date < _edgarFirstDay ? _edgarFirstDay : from.Date;
+            for (var day = first; day <= until.Date; day = day.AddDays(1))
+            {
+                if (day.DayOfWeek != DayOfWeek.Saturday && day.DayOfWeek != DayOfWeek.Sunday && !_edgarDays.Contains(day))
+                {
+                    days.Add(day);
+                }
+            }
+
+            return days;
+        }
+
+        /// <summary>The last complete EDGAR day when the rebuild runs, in the SEC's time zone.</summary>
+        private static DateTime YesterdayInNewYork()
+        {
+            return DateTime.UtcNow.ConvertFromUtc(TimeZones.NewYork).Date.AddDays(-1);
+        }
+
+        /// <summary>
+        /// The moment a filing's rows are published: the day after its filing date at the release
+        /// time. A daily run that reads a day it had missed publishes it only after its own
+        /// deployment date, so the rows carry that instead of a time the run was not there for.
+        /// </summary>
+        internal DateTime ReleaseOf(DateTime filingDate)
+        {
+            var read = _deploymentDate.HasValue && _deploymentDate.Value.Date > filingDate.Date
+                ? _deploymentDate.Value.Date
+                : filingDate.Date;
+            return read + AvailableAfterFilingDate;
         }
 
         /// <summary>
@@ -323,6 +485,25 @@ namespace QuantConnect.DataProcessing
                       $"read from {_processedDataDirectory}");
 
             RequireFilerStateForIncrementalRun();
+            RequireEdgarStateForIncrementalRun();
+        }
+
+        /// <summary>
+        /// Stops an incremental run that cannot tell which EDGAR days are already published: reading
+        /// one again would add its filings a second time under a later stamp.
+        /// </summary>
+        internal void RequireEdgarStateForIncrementalRun()
+        {
+            var path = Path.Combine(_processedDataDirectory, EdgarStateFileName);
+            if (File.Exists(path))
+            {
+                return;
+            }
+
+            throw new InvalidOperationException(
+                $"SEC13FDownloader.Run(): the incremental run for {_deploymentDate:yyyy-MM-dd} found no EDGAR state at " +
+                $"{path}, so it cannot tell a day already published from a new one. Republish the dataset with a full " +
+                "history run to restore it.");
         }
 
         /// <summary>
@@ -345,10 +526,10 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// One published archive: the zip name, its absolute URL, and the filing-receipt window it
-        /// covers.
+        /// One archive: the zip name, its absolute URL, and the filing-receipt window it covers. A
+        /// daily one is a day read from EDGAR, which may hold no holdings filing at all.
         /// </summary>
-        internal sealed record Archive(string Name, string Url, DateTime Start, DateTime End);
+        internal sealed record Archive(string Name, string Url, DateTime Start, DateTime End, bool IsDaily = false);
 
         /// <summary>
         /// Scrapes the data sets page for every published archive, oldest first, so a new window is
@@ -420,51 +601,63 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Picks the archives a run reads: all of them for a full pass. An incremental pass reads
-        /// every archive whose window ends on or after the last published release, plus any covering
-        /// the deployment date, so archives the SEC published while the job was down are not skipped.
-        /// The SEC publishes a window after it closes, so the covering one is usually not out yet.
+        /// The first day EDGAR is responsible for: the day after the last data set the rebuild read.
+        /// Earlier days came from the data sets and are not in the list, so a daily run must never
+        /// read them from EDGAR; it did once, and counted their filings twice.
         /// </summary>
-        internal List<Archive> SelectArchives(List<Archive> archives)
+        private DateTime _edgarFirstDay;
+
+        private const string EdgarFirstDayPrefix = "#from ";
+
+        /// <summary>Loads the EDGAR days an earlier run published. A full run reads them all again and starts empty.</summary>
+        internal void ReadEdgarState()
         {
             if (_deploymentDate == null)
             {
-                Log.Trace("SEC13FDownloader.SelectArchives(): full history");
-                return archives;
+                return;
             }
 
-            var date = _deploymentDate.Value.Date;
-            var lastPublished = LastPublishedRelease();
-            var selected = archives
-                .Where(x => x.End >= lastPublished || (x.Start <= date && date <= x.End))
-                .ToList();
-
-            if (selected.Count == 0)
+            var path = Path.Combine(_processedDataDirectory, EdgarStateFileName);
+            var header = false;
+            foreach (var line in File.ReadLines(path))
             {
-                selected.Add(archives[archives.Count - 1]);
+                if (line.StartsWith(EdgarFirstDayPrefix, StringComparison.Ordinal))
+                {
+                    _edgarFirstDay = DateTime.ParseExact(line.Substring(EdgarFirstDayPrefix.Length).Trim(),
+                        DateFormat.EightCharacter, CultureInfo.InvariantCulture);
+                    header = true;
+                }
+                else if (!string.IsNullOrWhiteSpace(line))
+                {
+                    _edgarDays.Add(DateTime.ParseExact(line.Trim(), DateFormat.EightCharacter, CultureInfo.InvariantCulture));
+                }
             }
 
-            Log.Trace($"SEC13FDownloader.SelectArchives(): incremental for {date:yyyy-MM-dd}, last published release " +
-                      $"{lastPublished:yyyy-MM-dd}");
-            return selected;
+            if (!header)
+            {
+                throw new InvalidDataException($"SEC13FDownloader.ReadEdgarState(): {path} does not say which day EDGAR " +
+                    "took over from the data sets, so a daily run could read a day twice. Republish with a full history run.");
+            }
+
+            Log.Trace($"SEC13FDownloader.ReadEdgarState(): EDGAR from {_edgarFirstDay:yyyy-MM-dd}, {_edgarDays.Count} " +
+                      $"days already published, the last {_edgarDays.Max:yyyy-MM-dd}");
         }
 
-        /// <summary>The newest release the published universe carries, or DateTime.MaxValue when there is none.</summary>
-        private DateTime LastPublishedRelease()
+        /// <summary>Publishes the day EDGAR took over and the days folded in so far, oldest first.</summary>
+        internal void WriteEdgarState()
         {
-            var universe = Path.Combine(_processedDataDirectory, "universe");
-            if (!Directory.Exists(universe))
+            Directory.CreateDirectory(_destinationDirectory);
+            SEC13FFiles.WriteThenMove(Path.Combine(_destinationDirectory, EdgarStateFileName), stream =>
             {
-                return DateTime.MaxValue;
-            }
-
-            var days = Directory.EnumerateFiles(universe, "*.csv")
-                .Select(file => DateTime.TryParseExact(Path.GetFileNameWithoutExtension(file), DateFormat.EightCharacter,
-                    CultureInfo.InvariantCulture, DateTimeStyles.None, out var day) ? day : (DateTime?)null)
-                .Where(day => day.HasValue)
-                .ToList();
-
-            return days.Count == 0 ? DateTime.MaxValue : days.Max().Value;
+                using var writer = new StreamWriter(stream, leaveOpen: true);
+                writer.Write(EdgarFirstDayPrefix + _edgarFirstDay.ToString(DateFormat.EightCharacter, CultureInfo.InvariantCulture));
+                writer.Write('\n');
+                foreach (var day in _edgarDays)
+                {
+                    writer.Write(day.ToString(DateFormat.EightCharacter, CultureInfo.InvariantCulture));
+                    writer.Write('\n');
+                }
+            });
         }
 
         /// <summary>
@@ -476,6 +669,7 @@ namespace QuantConnect.DataProcessing
             // One window's worth of resolutions is all that is worth holding: the key carries the
             // filing date, so entries from a window already read can never be hit again.
             _resolvedCusips.Clear();
+            _crosswalkResolutions.Clear();
             _admittedAmendments.Clear();
             _tickerOwners.Clear();
 
@@ -485,10 +679,11 @@ namespace QuantConnect.DataProcessing
             using var zip = new ZipArchive(stream, ZipArchiveMode.Read);
 
             var submissions = ReadSubmissions(zip, archive);
-            if (submissions.Count == 0)
+            if (submissions.Count == 0 && !archive.IsDaily)
             {
                 // The windows do not overlap, so an archive with no holdings means the layout moved,
-                // and carrying on would publish a history with this window missing.
+                // and carrying on would publish a history with this window missing. A single EDGAR
+                // day can legitimately carry none.
                 throw new InvalidDataException(
                     $"SEC13FDownloader.ProcessArchive(): {archive.Name} yielded no holdings submissions. " +
                     "An archive that contributes nothing means the upstream layout moved.");
@@ -684,13 +879,19 @@ namespace QuantConnect.DataProcessing
 
             /// <summary>Every reported value, originals and amendments, for the coverage summary.</summary>
             public decimal ReportedValue => HoldingValue + Amendments.Values.Sum(amendment => amendment.HoldingValue);
+
+            /// <summary>
+            /// The implied price, VALUE over SSHPRNAMT as reported, of every share line in the group,
+            /// which is what a crosswalk resolution is checked against the close with.
+            /// </summary>
+            public List<double> SharePrices { get; } = new();
         }
 
         /// <summary>
         /// Every (security, quarter, filer) already counted, so a filer reaches Holders once. Packed
         /// into a long (security index in bits 42..61, period index 32..41, CIK 0..31) because the
         /// history holds 58 million of them. The value is the filing date first counted on, as
-        /// yyyyMMdd, which PruneFilerState uses to make re-reading an archive idempotent.
+        /// yyyyMMdd, kept in the published state for whoever needs to tell when a filer arrived.
         /// </summary>
         private readonly Dictionary<long, int> _countedFilers = new();
 
@@ -755,42 +956,6 @@ namespace QuantConnect.DataProcessing
             }
 
             return newFilers;
-        }
-
-        /// <summary>
-        /// Forgets every filer first counted inside these archives' windows, so reading them again
-        /// recounts the same increments. Otherwise the second night would find the whole window
-        /// counted and publish Holders increments of zero over the real ones.
-        /// </summary>
-        internal void PruneFilerState(List<Archive> archives)
-        {
-            if (_deploymentDate == null || _countedFilers.Count == 0)
-            {
-                return;
-            }
-
-            var windows = archives
-                .Select(archive => (
-                    Start: int.Parse(archive.Start.ToStringInvariant(DateFormat.EightCharacter), CultureInfo.InvariantCulture),
-                    End: int.Parse(archive.End.ToStringInvariant(DateFormat.EightCharacter), CultureInfo.InvariantCulture)))
-                .ToList();
-
-            var stale = new List<long>();
-            foreach (var (key, stamp) in _countedFilers)
-            {
-                if (windows.Any(window => stamp >= window.Start && stamp <= window.End))
-                {
-                    stale.Add(key);
-                }
-            }
-
-            foreach (var key in stale)
-            {
-                _countedFilers.Remove(key);
-            }
-
-            Log.Trace($"SEC13FDownloader.PruneFilerState(): dropped {stale.Count} filers first counted inside " +
-                      $"{string.Join(", ", archives.Select(archive => archive.Name))}, {_countedFilers.Count} kept");
         }
 
         /// <summary>Swaps a filer key's security and period indexes through the given maps, keeping the CIK.</summary>
@@ -1024,6 +1189,11 @@ namespace QuantConnect.DataProcessing
                 // VALUE only counts under the share filter: unfiltered it totals $70.1 trillion for a
                 // single quarter. In whole dollars, whichever unit the line used.
                 var value = ParseDecimal(fields[columns["VALUE"]]);
+                if (value > 0m && amount > 0m)
+                {
+                    group.SharePrices.Add((double)(value / amount));
+                }
+
                 holding.Shares += amount;
                 holding.HoldingValue += value * units.Factor(accession, cusip, submission, value, amount);
                 holding.VotingSole += ParseDecimal(fields[columns["VOTING_AUTH_SOLE"]]);
@@ -1038,16 +1208,17 @@ namespace QuantConnect.DataProcessing
         /// <summary>
         /// The factors that turn VALUE into whole dollars. Filers do not all follow the 2023 unit
         /// change (in Apple's December 2019 quarter 85 lines in dollars made 88 percent of the scaled
-        /// total), and some mix units within one filing, so implied prices are compared with every
-        /// filer's median for the same security: per line where the security has enough reports to
-        /// trust its median, per filing otherwise. A thousand times off means the other unit.
+        /// total), and some mix units within one filing, so each implied price is compared with the
+        /// security's close on the quarter's last trading day: per line where the close is known, and
+        /// per filing, from its own lines, where it is not. Nothing here reads another filing, so a
+        /// filing comes out the same read alone on its day as inside a three month window. The
+        /// median of every filer in the window it replaces corrected a filing with others made weeks
+        /// after it.
         /// </summary>
-        internal static ValueUnits DetectValueUnits(ZipArchive zip, Archive archive,
-            Dictionary<string, Submission> submissions)
+        internal ValueUnits DetectValueUnits(ZipArchive zip, Archive archive, Dictionary<string, Submission> submissions)
         {
-            var keys = new Dictionary<(string Cusip, DateTime Period), int>();
-            var pricesByKey = new List<List<double>>();
-            var linesByFiling = new Dictionary<string, List<(int Key, double Price)>>(StringComparer.Ordinal);
+            var offsetsByFiling = new Dictionary<string, List<double>>(StringComparer.Ordinal);
+            var pricedByFiling = new Dictionary<string, int>(StringComparer.Ordinal);
 
             foreach (var (columns, fields) in ReadTable(zip, archive, "INFOTABLE.tsv",
                          "ACCESSION_NUMBER", "CUSIP", "VALUE", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL"))
@@ -1060,110 +1231,127 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
-                var value = ParseDecimal(fields[columns["VALUE"]]);
-                var amount = ParseDecimal(fields[columns["SSHPRNAMT"]]);
-                if (value <= 0m || amount <= 0m)
+                var offset = MarketOffset(fields[columns["CUSIP"]].Trim().ToUpperInvariant(), submission,
+                    ParseDecimal(fields[columns["VALUE"]]), ParseDecimal(fields[columns["SSHPRNAMT"]]));
+                if (offset == null)
                 {
                     continue;
                 }
 
-                var cusip = (fields[columns["CUSIP"]].Trim().ToUpperInvariant(), submission.Period);
-                if (!keys.TryGetValue(cusip, out var key))
+                pricedByFiling[accession] = pricedByFiling.GetValueOrDefault(accession) + 1;
+
+                // A price on no unit step says nothing about the unit the filing reports in.
+                if (UnitStep(offset.Value) == null)
                 {
-                    keys[cusip] = key = pricesByKey.Count;
-                    pricesByKey.Add(new List<double>());
+                    continue;
                 }
 
-                var price = (double)(value / amount);
-                pricesByKey[key].Add(price);
-
-                if (!linesByFiling.TryGetValue(accession, out var lines))
+                if (!offsetsByFiling.TryGetValue(accession, out var offsets))
                 {
-                    linesByFiling[accession] = lines = new List<(int, double)>();
+                    offsetsByFiling[accession] = offsets = new List<double>();
                 }
 
-                lines.Add((key, price));
+                offsets.Add(offset.Value);
             }
-
-            // A median needs a few reports behind it before it says anything about the unit.
-            var medians = pricesByKey
-                .Select(prices => prices.Count >= MinimumReportsForMedianPrice ? Median(prices) : double.NaN)
-                .ToArray();
 
             var units = new Dictionary<string, decimal>(StringComparer.Ordinal);
             var againstTheRule = 0;
             foreach (var (accession, submission) in submissions)
             {
-                var offsets = linesByFiling.TryGetValue(accession, out var lines)
-                    ? lines.Where(line => !double.IsNaN(medians[line.Key]))
-                        .Select(line => Math.Log10(line.Price / medians[line.Key]))
-                        .ToList()
-                    : new List<double>();
-
                 var thousandsRule = submission.FilingDate < ValueInWholeDollarsFrom;
-                units[accession] = ValueMultiplier(offsets, thousandsRule);
+                units[accession] = ValueMultiplier(
+                    offsetsByFiling.TryGetValue(accession, out var offsets) ? offsets : new List<double>(),
+                    pricedByFiling.GetValueOrDefault(accession), thousandsRule);
                 if (units[accession] != (thousandsRule ? 1000m : 1m))
                 {
                     againstTheRule++;
                 }
             }
 
-            Log.Trace($"SEC13FDownloader.DetectValueUnits(): {archive.Name}: {againstTheRule} of " +
-                      $"{submissions.Count} filings report VALUE in the other unit");
+            // Filings with closes to compare against whose lines mostly sit on no unit step.
+            var broken = new HashSet<string>(
+                pricedByFiling
+                    .Where(pair => !IsUnitEvidence(offsetsByFiling.GetValueOrDefault(pair.Key)?.Count ?? 0, pair.Value))
+                    .Select(pair => pair.Key),
+                StringComparer.Ordinal);
 
-            var references = keys
-                .Where(key => pricesByKey[key.Value].Count >= MinimumReportsForLineCorrection)
-                .ToDictionary(key => key.Key, key => medians[key.Value]);
-            return new ValueUnits(units, references);
+            Log.Trace($"SEC13FDownloader.DetectValueUnits(): {archive.Name}: {againstTheRule} of " +
+                      $"{submissions.Count} filings report VALUE in the other unit, {broken.Count} show no unit at all");
+
+            return new ValueUnits(units, broken, MarketOffset);
         }
 
         /// <summary>
-        /// The whole-dollar factor of each share line: its own, measured against the median price of
-        /// its security when that is well reported, or else the one decided for its whole filing.
+        /// log10 of a share line's implied price over its security's quarter-end close, or null when
+        /// the line has no price, the CUSIP resolves to nothing, or the close is not known. Near zero
+        /// the line is in whole dollars, near -3 in thousands.
+        /// </summary>
+        internal double? MarketOffset(string cusip, Submission submission, decimal value, decimal amount)
+        {
+            if (value <= 0m || amount <= 0m)
+            {
+                return null;
+            }
+
+            var security = ResolveSecurity(cusip, submission.FilingDate);
+            var close = security == null ? null : _closePrices.Close(security, submission.Period, submission.FilingDate);
+            return close == null ? null : Math.Log10((double)(value / amount / close.Value));
+        }
+
+        /// <summary>
+        /// The whole-dollar factor of each share line: its own, measured against its security's close
+        /// when that is known, or else the one decided for its whole filing.
         /// </summary>
         internal sealed class ValueUnits
         {
             private readonly Dictionary<string, decimal> _filings;
-            private readonly Dictionary<(string Cusip, DateTime Period), double> _references;
+            private readonly HashSet<string> _broken;
+            private readonly Func<string, Submission, decimal, decimal, double?> _marketOffset;
 
             /// <summary>Share lines whose factor differed from their filing's.</summary>
             public long CorrectedLines { get; private set; }
 
-            public ValueUnits(Dictionary<string, decimal> filings, Dictionary<(string Cusip, DateTime Period), double> references)
+            public ValueUnits(Dictionary<string, decimal> filings, HashSet<string> broken,
+                Func<string, Submission, decimal, decimal, double?> marketOffset)
             {
                 _filings = filings;
-                _references = references;
+                _broken = broken;
+                _marketOffset = marketOffset;
             }
 
             /// <summary>The factor for one share line of VALUE <paramref name="value"/> over <paramref name="amount"/> shares.</summary>
             public decimal Factor(string accession, string cusip, Submission submission, decimal value, decimal amount)
             {
+                // A filing whose lines mostly sit on no unit step keeps the rule of its filing date on
+                // every line: the few that land on a step do so by chance.
                 var filing = _filings[accession];
-                if (value <= 0m || amount <= 0m || !_references.TryGetValue((cusip, submission.Period), out var median))
+                if (_broken.Contains(accession))
                 {
                     return filing;
                 }
 
-                // How many thousandfold steps the line's price sits from the majority's, which reports
-                // in the unit of its filing date.
-                var steps = (int)Math.Clamp(Math.Round(Math.Log10((double)(value / amount) / median) / 3), -2, 2);
-                var factor = submission.FilingDate < ValueInWholeDollarsFrom ? 1000m : 1m;
-                for (var i = 0; i < Math.Abs(steps); i++)
-                {
-                    factor = steps > 0 ? factor / 1000m : factor * 1000m;
-                }
-
-                // One thousandfold step either way is a unit slip. A line a thousand times above the
-                // median in the dollar era is almost always a VALUE typed a thousand times too large:
-                // of the 4,740 such lines of the March 2023 quarter whose filer reported the same
-                // security the quarter before, 4,578 held the same shares then and 162 a thousand times
-                // more. A millionfold step is a wrong share count rather than a unit, and scaling it
-                // inflated Apple's 2019 quarters by ten percent, so such a line keeps its filing's factor.
-                if (factor > 1000m || factor < 0.001m)
+                var offset = _marketOffset(cusip, submission, value, amount);
+                if (offset == null)
                 {
                     return filing;
                 }
 
+                // The thousandfold step the line's price sits on: one below is VALUE in thousands, one
+                // above is VALUE typed a thousand times too large. That second case is a VALUE slip
+                // rather than a share count one: of the 4,740 such lines of the March 2023 quarter
+                // whose filer reported the same security the quarter before, 4,578 held the same
+                // shares then and 162 a thousand times more. A price on no step, a millionfold one
+                // included, says nothing about the unit and keeps the rule of its filing date rather
+                // than the filing's unit: scaling a millionfold step inflated Apple's 2019 quarters by
+                // ten percent, and scaling a bond at par against its issuer's stock put Seagate at
+                // $413 billion.
+                var step = UnitStep(offset.Value);
+                if (step == null)
+                {
+                    return submission.FilingDate < ValueInWholeDollarsFrom ? 1000m : 1m;
+                }
+
+                var factor = step == 0 ? 1m : step < 0 ? 1000m : 0.001m;
                 if (factor != filing)
                 {
                     CorrectedLines++;
@@ -1174,20 +1362,29 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Whether a filing's VALUE is multiplied by a thousand. The offsets are log10 of each of its
-        /// implied prices over the median for that security: near zero it uses the majority's unit,
-        /// near +3 it reports dollars where the rule is thousands, near -3 the reverse. With nothing
-        /// to compare against, the rule of the filing date stands.
+        /// Whether a filing's VALUE is multiplied by a thousand. The offsets are log10 of those of its
+        /// implied prices that sit on a unit step of the security's close, out of
+        /// <paramref name="priced"/> lines with a close: near zero the filing reports whole dollars,
+        /// near -3 thousands. They say so only when they are most of its priced lines. A filing whose
+        /// lines mostly sit on no step is broken rather than in another unit, and the few that land on
+        /// one do so by chance: a manager that typed its dollar values as share counts, a price of $1
+        /// on every line, looks like thousands against any close near $1,000. The rule of the filing
+        /// date stands then, as it does with nothing to compare against.
         /// </summary>
-        internal static decimal ValueMultiplier(List<double> offsets, bool thousandsRule)
+        internal static decimal ValueMultiplier(List<double> offsets, int priced, bool thousandsRule)
         {
-            var offset = offsets.Count == 0 ? 0d : Median(offsets);
-            if (thousandsRule)
+            if (!IsUnitEvidence(offsets.Count, priced))
             {
-                return offset > 1.5 ? 1m : 1000m;
+                return thousandsRule ? 1000m : 1m;
             }
 
-            return offset < -1.5 ? 1000m : 1m;
+            return Median(offsets) < -1.5 ? 1000m : 1m;
+        }
+
+        /// <summary>Whether a filing's lines on a unit step are most of its priced lines.</summary>
+        private static bool IsUnitEvidence(int onAStep, int priced)
+        {
+            return priced > 0 && onAStep * 2 > priced;
         }
 
         private static double Median(List<double> values)
@@ -1239,6 +1436,27 @@ namespace QuantConnect.DataProcessing
                         continue;
                     }
 
+                    // A crosswalk ticker is a fund administrator's free text, and a wrong one names
+                    // another company: DeFi Technologies at $2 reached the $129 Hashdex DEFI ETF and
+                    // gave it 111 holders. A group whose prices say so is dropped.
+                    if (_crosswalkResolutions.Contains((key.Cusip, key.FilingDate)) &&
+                        !KeepsCrosswalkGroup(key.Cusip, security, key.Period, key.FilingDate, holding.SharePrices))
+                    {
+                        if (IsEquityIssue(key.Cusip))
+                        {
+                            _mismatchedGroups++;
+                        }
+                        else
+                        {
+                            _debtCusipsRejected++;
+                        }
+
+                        _mismatchedValue += holding.ReportedValue;
+                        _unresolvedGroups++;
+                        _unresolvedValue += holding.ReportedValue;
+                        continue;
+                    }
+
                     // Counted after the guards above: a group that resolves to nothing must not
                     // consume the filer, or the day it does resolve would find it already taken.
                     resolved.Add((key, holding, security, ticker.ToLowerInvariant(),
@@ -1272,7 +1490,7 @@ namespace QuantConnect.DataProcessing
 
                     Queue(security.ToString(), ticker, new HoldingsRow
                     {
-                        Time = key.FilingDate + ReleaseTimeOfDay,
+                        Time = ReleaseOf(key.FilingDate),
                         PeriodEnd = key.Period,
                         Values = values,
                         ConfidentialOmitted = admitted.ConfidentialOmitted
@@ -1386,6 +1604,7 @@ namespace QuantConnect.DataProcessing
                     }
 
                     _resolvedCusips[key] = identifier;
+                    _crosswalkResolutions.Add(key);
                     return identifier;
                 }
 
@@ -1473,10 +1692,85 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
+        /// Priced share lines a crosswalk group needs before its prices can overrule the resolution. One
+        /// or two lines are usually one manager's slip, a stale price or a split, not another company:
+        /// on the December 2025 quarter, dropping on any disagreement removed 14,696 holders across
+        /// 3,249 tickers besides the misattributed ones, and requiring three lines halves that while
+        /// still removing 565 of the 637 misattributed holders.
+        /// </summary>
+        private const int PricedLinesToOverrule = 3;
+
+        /// <summary>
+        /// Whether a group reached through the crosswalk stays. A CUSIP whose issue number carries
+        /// letters is debt as a rule, and N-PORT tags a fund's bonds with the issuer's ticker, so
+        /// Etsy's convertible notes reached Etsy's stock: 171 million of the 298 million shares its
+        /// December 2022 quarter published. Such a group stays only when its prices are the security's
+        /// own, which is how the iShares iBonds ETFs, whose CUSIPs carry letters too, keep their
+        /// holders. Any other group is dropped only when enough of its prices say it is another
+        /// company, as Centerra Gold and Enerflex reached Carlyle and Equifax through their Toronto
+        /// tickers CG and EFX. A group without prices, a day of option positions only, or a security
+        /// the close file does not carry, cannot be checked and stays.
+        /// </summary>
+        internal bool KeepsCrosswalkGroup(string cusip, SecurityIdentifier security, DateTime period, DateTime filingDate,
+            List<double> prices)
+        {
+            var matches = PricesMatchClose(security, period, filingDate, prices);
+            if (!IsEquityIssue(cusip))
+            {
+                return matches == true;
+            }
+
+            return !(matches == false && prices.Count >= PricedLinesToOverrule);
+        }
+
+        /// <summary>
+        /// Whether a group's prices are the security's: at least half of them sit on a unit step of the
+        /// quarter-end close. Counted line by line rather than through a median, because a busy day
+        /// mixes managers in dollars and in thousands: Avanos on 5 February 2026 had four lines at
+        /// $0.0112 and four at $11.23, and their median sat half way, on neither. Null when the group
+        /// has no priced share line or the security has no close.
+        /// </summary>
+        private bool? PricesMatchClose(SecurityIdentifier security, DateTime period, DateTime filingDate, List<double> prices)
+        {
+            var close = _closePrices.Close(security, period, filingDate);
+            if (close == null || prices.Count == 0)
+            {
+                return null;
+            }
+
+            var onAStep = prices.Count(price => UnitStep(Math.Log10(price / (double)close.Value)) != null);
+            return onAStep * 2 >= prices.Count;
+        }
+
+        /// <summary>
+        /// The thousandfold step a line's price sits on against the close, given as log10 of their
+        /// ratio: 0 for whole dollars, -1 for thousands, 1 for a VALUE typed a thousand times too
+        /// large. Null when it sits on none, within PriceMatchTolerance, which is a price that says
+        /// nothing about the unit: another security, a bond at par against a stock, or a slip.
+        /// Scaling those by the nearest step put Seagate's December 2025 quarter at $413 billion.
+        /// </summary>
+        internal static int? UnitStep(double offset)
+        {
+            var steps = (int)Math.Round(offset / 3);
+            return Math.Abs(steps) <= 1 && Math.Abs(offset - 3 * steps) <= PriceMatchTolerance ? steps : null;
+        }
+
+        /// <summary>
+        /// Whether a CUSIP's issue number is an equity one: two digits, where debt uses letters. The
+        /// CUSIP is brought to nine characters first, since filers drop leading zeros and check digits.
+        /// </summary>
+        internal static bool IsEquityIssue(string cusip)
+        {
+            var nine = NormalizeCusip(cusip);
+            return nine != null && char.IsDigit(nine[6]) && char.IsDigit(nine[7]);
+        }
+
+        /// <summary>
         /// Resolves a CUSIP through the N-PORT ticker crosswalk. The ticker is resolved on the day
         /// the funds reported it, since a ticker names a security only on a date: at a 2021 filing
         /// META named a Roundhill ETF, not Facebook. The map file is checked first because
-        /// GenerateEquity never returns null for an unknown ticker.
+        /// GenerateEquity never returns null for an unknown ticker. Whether the group it resolves is
+        /// kept is KeepsCrosswalkGroup's call, on that day's prices.
         /// </summary>
         internal SecurityIdentifier ResolveThroughTicker(string cusip)
         {
@@ -2205,6 +2499,10 @@ namespace QuantConnect.DataProcessing
                       "of reported value, because the ticker belonged to another security that day, " +
                       $"{coverage.ToStringInvariant("F1")}% of reported value covered, " +
                       $"{_unchangedGroups} resolved groups added nothing new and wrote no row");
+            Log.Trace($"SEC13FDownloader.LogResolutionSummary(): {_mismatchedGroups} crosswalk groups dropped because " +
+                      $"their prices were another security's, {_debtCusipsRejected} groups of CUSIPs with letters in the issue " +
+                      "number dropped for want of a price matching the close, " +
+                      $"{(totalValue == 0m ? 0m : 100m * _mismatchedValue / totalValue).ToStringInvariant("F2")}% of reported value together");
 
             if (_unresolvedCusips.Count > 0)
             {
@@ -2319,6 +2617,28 @@ namespace QuantConnect.DataProcessing
             return WithRetry(url, () =>
             {
                 using var response = _client.GetAsync(url).GetAwaiter().GetResult();
+                response.EnsureSuccessStatusCode();
+                return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            });
+        }
+
+        /// <summary>
+        /// GETs a URL as text, or null when EDGAR says the file is not there. For a daily index that
+        /// does not exist it answers 403 rather than 404: a weekend, Memorial Day and Labor Day 2026
+        /// all came back 403 against 200 for a business day. A block would also be a 403, and then
+        /// the day is simply read by a later run, while a listed filing that will not come fails the
+        /// build of its day. Anything else fails once the retries run out, as in UrlExists.
+        /// </summary>
+        private string TryGetText(string url)
+        {
+            return WithRetry(url, () =>
+            {
+                using var response = _client.GetAsync(url).GetAwaiter().GetResult();
+                if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
+                {
+                    return null;
+                }
+
                 response.EnsureSuccessStatusCode();
                 return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
             });

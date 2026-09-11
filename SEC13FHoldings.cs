@@ -110,6 +110,13 @@ namespace QuantConnect.DataSource
         /// <summary>Name of the dataset's folder under alternative/sec/, which is where its files live.</summary>
         public static string ReportFolder => "13f";
 
+        /// <summary>
+        /// Time of day a release date's rows become available. EDGAR lists a day's filings at about
+        /// 22:05 ET, the daily job reads them at 01:00 ET the next day and publishes by 03:00, so a
+        /// filing is released the day after its filing date at this time, before the market opens.
+        /// </summary>
+        public static TimeSpan ReleaseTimeOfDay => TimeSpan.FromHours(3);
+
         /// <summary>Parses one measure column, where an empty field is an absent reading.</summary>
         internal static decimal? ParseMeasure(string value)
         {

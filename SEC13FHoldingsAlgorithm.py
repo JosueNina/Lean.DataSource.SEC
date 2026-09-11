@@ -62,9 +62,10 @@ class SEC13FHoldingsAlgorithm(QCAlgorithm):
             if equity is None:
                 continue
 
-            # time is the filing date and period_end the quarter the numbers describe, typically 45
-            # to 135 days earlier. Every value is cumulative for period_end: it counts every manager
-            # that had reported the security by this date.
+            # time is when the point was published, 03:00 ET the day after the filing date, and
+            # period_end the quarter the numbers describe, typically 45 to 135 days earlier. Every
+            # value is cumulative for period_end: it counts every manager that had reported the
+            # security by then.
             self.log(f"{self.time:%Y-%m-%d} {equity.value} - Period: {holding.period_end:%Y-%m-%d}, Holders: {holding.holders}, Shares: {holding.shares}, HoldingValue: {holding.holding_value}")
 
             self._holders_by_equity.setdefault(equity, {})[holding.period_end] = holding.holders
@@ -81,8 +82,9 @@ class SEC13FHoldingsAlgorithm(QCAlgorithm):
 
         leader = sorted(self._holders_by_equity.items(), key=lambda kvp: (-breadth(kvp[1]), kvp[0].value))[0][0]
 
-        # A 13F lands on its filing date, which is not necessarily a day the equity printed a bar,
-        # so the order waits for a price rather than firing against a stale one.
+        # A 13F point lands before the open on the day after its filing, which is not necessarily a
+        # day the equity prints a bar, so the order waits for a price rather than firing against a
+        # stale one.
         if leader == self._invested or leader not in slice.bars:
             return
 

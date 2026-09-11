@@ -42,8 +42,6 @@ namespace QuantConnect.DataSource
     [ProtoContract(SkipConstructor = true)]
     public class SEC13FHoldingsUniverse : BaseDataCollection
     {
-        private static readonly TimeSpan _period = TimeSpan.FromDays(1);
-
         // The frozen layout: the identifier, the ticker, the reported quarter, eight measures and
         // the confidential treatment flag.
         private const int ExpectedColumns = 12;
@@ -103,8 +101,11 @@ namespace QuantConnect.DataSource
         [ProtoMember(19)]
         public bool ConfidentialOmitted { get; set; }
 
-        /// <summary>The time the data point ends and becomes available to the algorithm.</summary>
-        public override DateTime EndTime => Time + _period;
+        /// <summary>
+        /// The time the data point becomes available to the algorithm: the release time on its
+        /// release date, when the daily job has published the file.
+        /// </summary>
+        public override DateTime EndTime => Time + SEC13FHoldings.ReleaseTimeOfDay;
 
         /// <summary>Location of the universe file: alternative/sec/13f/universe/{yyyyMMdd}.csv</summary>
         public override SubscriptionDataSource GetSource(SubscriptionDataConfig config, DateTime date, bool isLiveMode)

@@ -84,9 +84,11 @@ public override void OnData(Slice slice)
 }
 ```
 
-A data point's `Time` and `EndTime` are both the moment the filing became public, and the quarter
-the numbers describe is carried in `PeriodEnd`. There is no publication offset to model: the point
-IS the publication. Your algorithm therefore reads a position only once the public record held it.
+A data point's `Time` and `EndTime` are both the moment it was published, 03:00 ET on the day after
+the filing date, and the quarter the numbers describe is carried in `PeriodEnd`. EDGAR lists a day's
+filings at about 22:05 ET and the daily job reads them after midnight, so this is the earliest a live
+algorithm can have them, and history uses the same stamp. Your algorithm therefore reads a position
+only once the dataset could have delivered it.
 The gap between the two is not a constant and cannot be derived: measured across 11,761 filings in
 one window it runs minimum 0 days, p10 16, median 42, p90 48, maximum 6,596, and 10.4 percent of
 filings arrive later than the 45 day deadline. A point that arrives today therefore describes a

@@ -96,12 +96,13 @@ namespace QuantConnect.DataLibrary.Tests
         public void TimeIsTheRequestedReleaseDate()
         {
             // The file name is the release date, so Time comes from the requested date, never from
-            // a column. EndTime is one day later, matching FINRAShortInterestUniverse.
+            // a column. EndTime is the release time on that date, when the daily job has published
+            // the file, the same instant the per-security rows carry.
             var date = new DateTime(2021, 8, 16);
             var point = Read(FullLine, date);
 
             Assert.AreEqual(date, point.Time);
-            Assert.AreEqual(date.AddDays(1), point.EndTime);
+            Assert.AreEqual(date.Add(SEC13FHoldings.ReleaseTimeOfDay), point.EndTime);
             Assert.AreNotEqual(point.Time, point.EndTime);
             Assert.Greater(point.EndTime, point.Time);
         }

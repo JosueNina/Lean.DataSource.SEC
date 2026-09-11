@@ -85,9 +85,10 @@ namespace QuantConnect.DataLibrary.Tests
                     continue;
                 }
 
-                // Time is the filing date and PeriodEnd the quarter the numbers describe, typically
-                // 45 to 135 days earlier. Every value is cumulative for PeriodEnd: it counts every
-                // manager that had reported the security by this date.
+                // Time is when the point was published, 03:00 ET the day after the filing date, and
+                // PeriodEnd the quarter the numbers describe, typically 45 to 135 days earlier. Every
+                // value is cumulative for PeriodEnd: it counts every manager that had reported the
+                // security by then.
                 Log($"{Time:yyyy-MM-dd} {equity.Value} - Period: {holding.PeriodEnd:yyyy-MM-dd}, Holders: {holding.Holders}, Shares: {holding.Shares}, HoldingValue: {holding.HoldingValue}");
 
                 if (!_holdersByEquity.TryGetValue(equity, out var quarters))
@@ -113,8 +114,9 @@ namespace QuantConnect.DataLibrary.Tests
                 .First()
                 .Key;
 
-            // A 13F lands on its filing date, which is not necessarily a day the equity printed a
-            // bar, so the order waits for a price rather than firing against a stale one.
+            // A 13F point lands before the open on the day after its filing, which is not necessarily
+            // a day the equity prints a bar, so the order waits for a price rather than firing
+            // against a stale one.
             if (leader == _invested || !slice.Bars.ContainsKey(leader))
             {
                 return;
