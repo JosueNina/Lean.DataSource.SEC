@@ -22,6 +22,8 @@ using System.Linq;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
+using Newtonsoft.Json;
+using QuantConnect.DataSource;
 using QuantConnect.Logging;
 
 namespace QuantConnect.DataProcessing
@@ -39,7 +41,7 @@ namespace QuantConnect.DataProcessing
     /// </summary>
     internal static class SEC13FEdgarDay
     {
-        private const string DailyIndexUrlFormat = "https://www.sec.gov/Archives/edgar/daily-index/{0}/QTR{1}/form.{2}.idx";
+        private const string DailyIndexRootUrl = "https://www.sec.gov/Archives/edgar/daily-index/";
         private const string ArchivesBaseUrl = "https://www.sec.gov/Archives/";
 
         private const string PrimaryDocumentTypePrefix = "13F-HR";
@@ -83,10 +85,12 @@ namespace QuantConnect.DataProcessing
 
         /// <summary>
         /// Writes the day's archive into <paramref name="directory"/> and returns its path, or null
-        /// when EDGAR has no index for the day yet, which is every weekend and holiday and a day
-        /// whose index is late. <paramref name="tryGetText"/> returns null on a 404.
+        /// when EDGAR has not published an index for the day, which is every weekend and holiday and a
+        /// day whose index is late. <paramref name="listDirectory"/> returns the names in one of EDGAR's
+        /// directory listings and <paramref name="getText"/> a file; both throw on any failure.
         /// </summary>
-        public static string Build(DateTime day, string directory, Func<string, string> tryGetText)
+        public static string Build(DateTime day, string directory, Func<string, ISet<string>> listDirectory,
+            Func<string, string> getText)
         {
             var path = System.IO.Path.Combine(directory, ArchiveName(day));
             if (File.Exists(path))
@@ -94,20 +98,16 @@ namespace QuantConnect.DataProcessing
                 return path;
             }
 
-            var index = tryGetText(IndexUrl(day));
-            if (index == null)
+            if (!IsIndexPublished(day, listDirectory))
             {
                 return null;
             }
 
-            var entries = ParseIndex(index);
+            var entries = ParseIndex(getText(IndexUrl(day)));
             var filings = new List<Filing>(entries.Count);
             foreach (var entry in entries)
             {
-                var text = tryGetText(ArchivesBaseUrl + entry.Path)
-                    ?? throw new InvalidOperationException(
-                        $"SEC13FEdgarDay.Build(): {entry.Path} is listed in the {day:yyyy-MM-dd} index but not published");
-                filings.Add(ParseFiling(entry, text));
+                filings.Add(ParseFiling(entry, getText(ArchivesBaseUrl + entry.Path)));
             }
 
             Directory.CreateDirectory(directory);
@@ -121,9 +121,40 @@ namespace QuantConnect.DataProcessing
         /// <summary>The daily form index, which lists a day's filings by form type.</summary>
         internal static string IndexUrl(DateTime day)
         {
-            return string.Format(CultureInfo.InvariantCulture, DailyIndexUrlFormat,
-                day.Year, (day.Month - 1) / 3 + 1, day.ToString(DateFormat.EightCharacter, CultureInfo.InvariantCulture));
+            return $"{QuarterUrl(day)}{IndexFileName(day)}";
         }
+
+        /// <summary>
+        /// Whether EDGAR lists the day's form index. The answer comes from its directory listings,
+        /// never from a failed request: EDGAR answers 403 both for an index that does not exist and
+        /// for a reader it has blocked, and a block taken for "no index" dropped the day for good. Each
+        /// folder is looked up in its parent's listing first, from the root, which always exists: a
+        /// year or quarter EDGAR has not created yet answers 403 as well.
+        /// </summary>
+        internal static bool IsIndexPublished(DateTime day, Func<string, ISet<string>> listDirectory)
+        {
+            var year = day.Year.ToString(CultureInfo.InvariantCulture);
+            return listDirectory(DailyIndexRootUrl).Contains(year)
+                   && listDirectory($"{DailyIndexRootUrl}{year}/").Contains(QuarterName(day))
+                   && listDirectory(QuarterUrl(day)).Contains(IndexFileName(day));
+        }
+
+        /// <summary>The names in one of EDGAR's index.json directory listings.</summary>
+        internal static HashSet<string> ListingNames(string json)
+        {
+            var listing = JsonConvert.DeserializeObject<SECReportIndexFile>(json)?.Directory
+                ?? throw new InvalidDataException("SEC13FEdgarDay.ListingNames(): not an EDGAR directory listing");
+
+            return (listing.Items ?? new List<SECReportIndexItem>()).Select(item => item.Name).ToHashSet(StringComparer.Ordinal);
+        }
+
+        private static string QuarterName(DateTime day) => $"QTR{(day.Month - 1) / 3 + 1}";
+
+        private static string QuarterUrl(DateTime day) =>
+            $"{DailyIndexRootUrl}{day.Year.ToString(CultureInfo.InvariantCulture)}/{QuarterName(day)}/";
+
+        private static string IndexFileName(DateTime day) =>
+            $"form.{day.ToString(DateFormat.EightCharacter, CultureInfo.InvariantCulture)}.idx";
 
         /// <summary>
         /// The holdings reports and their amendments listed in a daily index. Notices are left out:

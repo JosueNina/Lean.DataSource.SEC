@@ -39,10 +39,19 @@ using QuantConnect.Util;
 namespace QuantConnect.DataProcessing
 {
     /// <summary>
-    /// Converts the SEC Form 13F structured data sets, one zip per filing window, into LEAN's
-    /// per-security files and one universe file per release date. Without
-    /// QC_DATAFLEET_DEPLOYMENT_DATE it rebuilds the whole history; with it, it reads the archive
-    /// covering that date and folds it into the published history.
+    /// Converts Form 13F filings into LEAN's per-security files and one universe file per release
+    /// date. Without QC_DATAFLEET_DEPLOYMENT_DATE it rebuilds the whole history, from the SEC's
+    /// structured data sets through the last window published and from EDGAR's daily indexes after
+    /// it; with it, it reads that day from EDGAR, with any recent day whose index came late, and
+    /// folds them into the published history.
+    ///
+    /// Besides the data folders it reads these config keys: sec-user-agent-company-name and
+    /// sec-user-agent-company-email, which the SEC asks automated readers for; sec-13f-rebuild-history,
+    /// which a run without a deployment date needs; and, for checks only, sec-13f-edgar-from,
+    /// sec-13f-edgar-until and sec-13f-rebuild-from, which move the rebuild's EDGAR days and skip the
+    /// older data sets. From the data folder it reads the map files and security-database.csv, which
+    /// resolve CUSIPs and tickers, and the coarse universe files, whose quarter-end closes decide
+    /// VALUE's unit and vet the crosswalk.
     /// </summary>
     public class SEC13FDownloader : IDisposable
     {
@@ -241,6 +250,9 @@ namespace QuantConnect.DataProcessing
         /// <summary>EDGAR days already folded into the history, published so a daily run never reads one twice.</summary>
         private readonly SortedSet<DateTime> _edgarDays = new();
 
+        /// <summary>EDGAR's daily index directory listings, by folder URL, read once a run.</summary>
+        private readonly Dictionary<string, ISet<string>> _edgarListings = new(StringComparer.Ordinal);
+
         private readonly DateTime? _edgarFrom;
         private readonly DateTime? _edgarUntil;
 
@@ -294,7 +306,8 @@ namespace QuantConnect.DataProcessing
             if (!_closePrices.Available)
             {
                 Log.Error("SEC13FDownloader(): the coarse universe files are missing from the data folder. Without the " +
-                          "quarter-end closes VALUE falls back to the SEC unit rule and every crosswalk resolution is dropped.");
+                          "quarter-end closes VALUE takes the SEC unit rule of each filing's date, and a crosswalk match whose " +
+                          "CUSIP carries letters in its issue number, which only a price can confirm, is dropped.");
             }
 
             _edgarFrom = ParseOptionalDate(Config.Get(EdgarFromKey), EdgarFromKey);
@@ -373,10 +386,10 @@ namespace QuantConnect.DataProcessing
             var read = 0;
             foreach (var day in days)
             {
-                var path = SEC13FEdgarDay.Build(day, _archiveCacheDirectory, TryGetText);
+                var path = SEC13FEdgarDay.Build(day, _archiveCacheDirectory, ListEdgarDirectory, GetWithRetry);
                 if (path == null)
                 {
-                    Log.Trace($"SEC13FDownloader.ProcessEdgarDays(): EDGAR has no index for {day:yyyy-MM-dd}");
+                    Log.Trace($"SEC13FDownloader.ProcessEdgarDays(): EDGAR lists no index for {day:yyyy-MM-dd}");
                     continue;
                 }
 
@@ -1322,8 +1335,8 @@ namespace QuantConnect.DataProcessing
             /// <summary>The factor for one share line of VALUE <paramref name="value"/> over <paramref name="amount"/> shares.</summary>
             public decimal Factor(string accession, string cusip, Submission submission, decimal value, decimal amount)
             {
-                // A filing whose lines mostly sit on no unit step keeps the rule of its filing date on
-                // every line: the few that land on a step do so by chance.
+                // A filing whose lines mostly sit on no unit step keeps its unscaled factor on every
+                // line: the few that land on a step do so by chance.
                 var filing = _filings[accession];
                 if (_broken.Contains(accession))
                 {
@@ -1341,14 +1354,15 @@ namespace QuantConnect.DataProcessing
                 // rather than a share count one: of the 4,740 such lines of the March 2023 quarter
                 // whose filer reported the same security the quarter before, 4,578 held the same
                 // shares then and 162 a thousand times more. A price on no step, a millionfold one
-                // included, says nothing about the unit and keeps the rule of its filing date rather
-                // than the filing's unit: scaling a millionfold step inflated Apple's 2019 quarters by
-                // ten percent, and scaling a bond at par against its issuer's stock put Seagate at
-                // $413 billion.
+                // included, cannot be checked, so it takes the smaller of its filing's unit and the rule
+                // of its filing date. Either one alone inflates an era: the rule scaled the odd lines of
+                // filers in whole dollars before 2023 ($730 billion in the September 2022 quarter), the
+                // filing's unit those of filers still in thousands in early 2023 ($879 billion in
+                // December 2022). Scaling by the nearest step put Seagate at $413 billion.
                 var step = UnitStep(offset.Value);
                 if (step == null)
                 {
-                    return submission.FilingDate < ValueInWholeDollarsFrom ? 1000m : 1m;
+                    return Math.Min(filing, submission.FilingDate < ValueInWholeDollarsFrom ? 1000m : 1m);
                 }
 
                 var factor = step == 0 ? 1m : step < 0 ? 1000m : 0.001m;
@@ -1368,14 +1382,16 @@ namespace QuantConnect.DataProcessing
         /// near -3 thousands. They say so only when they are most of its priced lines. A filing whose
         /// lines mostly sit on no step is broken rather than in another unit, and the few that land on
         /// one do so by chance: a manager that typed its dollar values as share counts, a price of $1
-        /// on every line, looks like thousands against any close near $1,000. The rule of the filing
-        /// date stands then, as it does with nothing to compare against.
+        /// on every line, looks like thousands against any close near $1,000. Such a filing is never
+        /// scaled up: before 2023 the rule multiplied it by a thousand, and one manager whose share
+        /// counts carried VALUE in thousands, $1,000 a share on every line, put Alphabet's September
+        /// 2020 quarter 9.5 percent above its close. With nothing to compare against, the rule stands.
         /// </summary>
         internal static decimal ValueMultiplier(List<double> offsets, int priced, bool thousandsRule)
         {
             if (!IsUnitEvidence(offsets.Count, priced))
             {
-                return thousandsRule ? 1000m : 1m;
+                return priced == 0 && thousandsRule ? 1000m : 1m;
             }
 
             return Median(offsets) < -1.5 ? 1000m : 1m;
@@ -2623,25 +2639,18 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// GETs a URL as text, or null when EDGAR says the file is not there. For a daily index that
-        /// does not exist it answers 403 rather than 404: a weekend, Memorial Day and Labor Day 2026
-        /// all came back 403 against 200 for a business day. A block would also be a 403, and then
-        /// the day is simply read by a later run, while a listed filing that will not come fails the
-        /// build of its day. Anything else fails once the retries run out, as in UrlExists.
+        /// The names in one of EDGAR's directory listings. Read once a run, so a day published after
+        /// the run read its quarter is left to the next run. Fails like any other GET, a block included.
         /// </summary>
-        private string TryGetText(string url)
+        private ISet<string> ListEdgarDirectory(string url)
         {
-            return WithRetry(url, () =>
+            if (!_edgarListings.TryGetValue(url, out var names))
             {
-                using var response = _client.GetAsync(url).GetAwaiter().GetResult();
-                if (response.StatusCode is HttpStatusCode.NotFound or HttpStatusCode.Forbidden)
-                {
-                    return null;
-                }
+                names = SEC13FEdgarDay.ListingNames(GetWithRetry(url + "index.json"));
+                _edgarListings[url] = names;
+            }
 
-                response.EnsureSuccessStatusCode();
-                return response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-            });
+            return names;
         }
 
         /// <summary>

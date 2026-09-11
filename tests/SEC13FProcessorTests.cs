@@ -18,6 +18,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Text;
 using NUnit.Framework;
 using QuantConnect.Configuration;
@@ -298,8 +300,8 @@ namespace QuantConnect.DataLibrary.Tests
             // The SEC asks automated readers to identify themselves, and the reports dataset reads the
             // name and email from these two keys. Without them the run stops instead of calling out
             // anonymously.
-            var previousName = Config.Get("sec-user-agent-company-name");
-            var previousEmail = Config.Get("sec-user-agent-company-email");
+            var previousName = Config.Get("sec-user-agent-company-name", null);
+            var previousEmail = Config.Get("sec-user-agent-company-email", null);
             try
             {
                 Config.Set("sec-user-agent-company-name", string.Empty);
@@ -310,8 +312,17 @@ namespace QuantConnect.DataLibrary.Tests
             }
             finally
             {
-                Config.Set("sec-user-agent-company-name", previousName);
-                Config.Set("sec-user-agent-company-email", previousEmail);
+                // As in TearDown: written back as an empty string, an absent key would stay set.
+                Config.Reset();
+                if (previousName != null)
+                {
+                    Config.Set("sec-user-agent-company-name", previousName);
+                }
+
+                if (previousEmail != null)
+                {
+                    Config.Set("sec-user-agent-company-email", previousEmail);
+                }
             }
         }
 
@@ -329,14 +340,16 @@ namespace QuantConnect.DataLibrary.Tests
                 new[]
                 {
                     Line("0000000000-00-000001", "037833100", "29", "100", "SH"),
+                    Line("0000000000-00-000002", "037833100", "29", "100", "SH"),
+                    Line("0000000000-00-000002", "037833100", "29", "100", "SH"),
                     Line("0000000000-00-000002", "037833100", "29", "100000", "SH")
                 },
                 resolve: true,
                 Submission("0000000000-00-000001", filing, quarter, cik: 1),
                 Submission("0000000000-00-000002", filing, quarter, cik: 2));
 
-            Assert.AreEqual(2 * 29000m, holdings.Values.Single().HoldingValue,
-                "the odd line keeps the thousands factor of its filing");
+            Assert.AreEqual(4 * 29000m, holdings.Values.Single().HoldingValue,
+                "the odd line keeps the thousands factor its other lines prove");
         }
 
         [TestCase(true, 1000, 0, new double[0])]                  // nothing to compare against: the rule stands
@@ -346,6 +359,7 @@ namespace QuantConnect.DataLibrary.Tests
         [TestCase(false, 1, 2, new[] { 0.1, -0.1 })]
         [TestCase(false, 1000, 3, new[] { -3.0, -2.8, 0.1 })]     // still thousands after 2023
         [TestCase(false, 1, 10, new[] { -3.0, -2.9 })]            // two of ten priced lines on a step: no evidence
+        [TestCase(true, 1, 10, new[] { -3.0, -2.9 })]             // and before 2023 it is not scaled up either
         public void AFilingsUnitComesFromHowItsPricesCompareWithTheClose(bool thousandsRule,
             decimal expected, int priced, double[] offsets)
         {
@@ -1389,6 +1403,53 @@ namespace QuantConnect.DataLibrary.Tests
                 "the $2.50 line keeps its filing's dollar factor instead of becoming $2.5 million");
         }
 
+        [Test]
+        public void ABrokenFilingIsNeverScaledUp()
+        {
+            // Every line reads $1,000 a share, since SSHPRNAMT carries VALUE in thousands. Two of the
+            // four prices land on a unit step by chance, not most, so the filing shows no unit. Before
+            // 2023 the rule multiplied it by a thousand, and one such manager put Alphabet's September
+            // 2020 quarter 9.5 percent above its close.
+            SeedCloses("20200930", ("aapl", 100m), ("msft", 200m), ("nvda", 500m), ("spy", 330m));
+            var holdings = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000001", "037833100", "1000000", "1000", "SH"),
+                    Line("0000000000-00-000001", "594918104", "1000000", "1000", "SH"),
+                    Line("0000000000-00-000001", "67066G104", "1000000", "1000", "SH"),
+                    Line("0000000000-00-000001", "78462F103", "1000000", "1000", "SH")
+                },
+                resolve: true,
+                Submission("0000000000-00-000001", new DateTime(2020, 11, 6), new DateTime(2020, 9, 30), cik: 1));
+
+            Assert.AreEqual(4, holdings.Count);
+            Assert.IsTrue(holdings.Values.All(holding => holding.HoldingValue == 1000000m),
+                string.Join(", ", holdings.Values.Select(holding => holding.HoldingValue)));
+        }
+
+        [TestCase("20200814", "20200630", "20200630", "250000", "2500", 752500)] // dollars before 2023: the rule made the $2.50 line $2,500
+        [TestCase("20230214", "20221231", "20221230", "250", "25", 750025)]      // thousands in 2023: the filing's unit made it 1,000 times larger
+        public void ALineOnNoStepIsNeverScaledPastItsFilingOrItsDate(string filed, string quarter, string closeDay,
+            string onStep, string offStep, decimal expected)
+        {
+            // Three lines prove the filing's unit and a fourth sits on no step. It cannot be checked, so
+            // it takes the smaller of the filing's unit and the rule of the filing date: either one alone
+            // inflated one era by hundreds of billions.
+            SeedCloses(closeDay, ("aapl", 250m));
+            var holdings = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000001", "037833100", onStep, "1000", "SH"),
+                    Line("0000000000-00-000001", "037833100", onStep, "1000", "SH"),
+                    Line("0000000000-00-000001", "037833100", onStep, "1000", "SH"),
+                    Line("0000000000-00-000001", "037833100", offStep, "1000", "SH")
+                },
+                resolve: true,
+                Submission("0000000000-00-000001", Time.ParseDate(filed), Time.ParseDate(quarter), cik: 1));
+
+            Assert.AreEqual(expected, holdings.Values.Single().HoldingValue);
+        }
+
         [TestCase(0.0, 0)]
         [TestCase(-3.0, -1)]
         [TestCase(3.1, 1)]
@@ -1487,6 +1548,49 @@ namespace QuantConnect.DataLibrary.Tests
             Assert.AreEqual(2, lines.Count);
             Assert.AreEqual("037833100", lines[1].Fields[lines[1].Columns["CUSIP"]]);
             Assert.AreEqual("Put", lines[1].Fields[lines[1].Columns["PUTCALL"]]);
+        }
+
+        [Test]
+        public void AnEdgarDayIsPublishedOnlyWhenItsQuarterListsItsIndex()
+        {
+            // EDGAR answers 403 both for an index that does not exist and for a reader it has blocked,
+            // so whether a day is out comes from its listings. A folder EDGAR has not created yet
+            // answers 403 too, so it is looked up in its parent first: requesting any folder missing
+            // from this map throws, and fails the test.
+            const string root = "https://www.sec.gov/Archives/edgar/daily-index/";
+            var listings = new Dictionary<string, ISet<string>>
+            {
+                [root] = new HashSet<string> { "2025", "2026" },
+                [root + "2026/"] = new HashSet<string> { "QTR1", "QTR2", "QTR3" },
+                [root + "2026/QTR3/"] = new HashSet<string> { "form.20260904.idx", "form.20260908.idx" }
+            };
+
+            Assert.IsTrue(SEC13FEdgarDay.IsIndexPublished(new DateTime(2026, 9, 8), url => listings[url]));
+            Assert.IsFalse(SEC13FEdgarDay.IsIndexPublished(new DateTime(2026, 9, 7), url => listings[url]), "Labor Day");
+            Assert.IsFalse(SEC13FEdgarDay.IsIndexPublished(new DateTime(2026, 10, 1), url => listings[url]), "a new quarter");
+            Assert.IsFalse(SEC13FEdgarDay.IsIndexPublished(new DateTime(2027, 1, 4), url => listings[url]), "a new year");
+        }
+
+        [Test]
+        public void AnEdgarBlockFailsTheDayInsteadOfSkippingIt()
+        {
+            // Taken for "no index", a blocked day was never recorded and fell out of reach of the
+            // daily run's lookback, so the rebuild lost it for good.
+            HttpRequestException Blocked() => new("Forbidden", null, HttpStatusCode.Forbidden);
+
+            Assert.Throws<HttpRequestException>(() => SEC13FEdgarDay.Build(new DateTime(2026, 9, 8), _root,
+                _ => throw Blocked(), _ => throw Blocked()));
+        }
+
+        [Test]
+        public void AnEdgarListingYieldsItsNames()
+        {
+            const string listing = @"{""directory"":{""item"":[{""last-modified"":""09\/08\/2026 10:02:29 PM""," +
+                @"""name"":""form.20260908.idx"",""type"":""file"",""href"":""form.20260908.idx"",""size"":""782 KB""}]," +
+                @"""name"":""daily-index\/2026\/QTR3\/"",""parent-dir"":""..\/""}}";
+
+            Assert.AreEqual(new[] { "form.20260908.idx" }, SEC13FEdgarDay.ListingNames(listing).ToArray());
+            Assert.Throws<InvalidDataException>(() => SEC13FEdgarDay.ListingNames("{}"));
         }
 
         private static SEC13FEdgarDay.IndexEntry SampleEntry()
