@@ -68,7 +68,7 @@ namespace QuantConnect.DataProcessing
         private const string SecBaseUrl = "https://www.sec.gov";
 
 
-        private const int MaxRetries = 5;
+        private const int MaxRetries = 8;
 
         // A 13F-NT is a notice that the manager's holdings are reported on someone else's filing. It
         // carries no INFOTABLE at all, so it is not a zero position and must not become one.
@@ -2654,8 +2654,9 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Sends a request through the rate gate, retrying with a growing backoff whatever
-        /// IsWorthRetrying accepts. The last failure is the one that surfaces.
+        /// Sends a request through the rate gate, retrying whatever IsWorthRetrying accepts with a
+        /// backoff that doubles up to two minutes, about four minutes in all: EDGAR served a new
+        /// filer's listed filing as a 404 for over a minute. The last failure is the one that surfaces.
         /// </summary>
         private T WithRetry<T>(string url, Func<T> request)
         {
@@ -2670,21 +2671,24 @@ namespace QuantConnect.DataProcessing
                 catch (Exception err) when (attempt < MaxRetries && IsWorthRetrying(err))
                 {
                     Log.Trace($"SEC13FDownloader.WithRetry(): {url} retry {attempt}/{MaxRetries} after: {err.Message}");
-                    Thread.Sleep(TimeSpan.FromSeconds(2 * attempt));
+                    Thread.Sleep(TimeSpan.FromSeconds(Math.Min(120, Math.Pow(2, attempt))));
                 }
             }
         }
 
         /// <summary>
-        /// True when a failed request is worth asking again: transport errors, server errors and
-        /// throttling. A 403 or a 404 from the SEC does not change on a retry.
+        /// True when a failed request is worth asking again: transport errors, server errors,
+        /// throttling and a 404. Every file requested is one the SEC lists, so a 404 is its own
+        /// hiccup: the first filings of two new filers, in the 24 and 27 July 2026 indexes, answered
+        /// 404 for up to a minute and 200 afterwards. A 403 is a block, which outlasts any backoff.
         /// </summary>
-        private static bool IsWorthRetrying(Exception error)
+        internal static bool IsWorthRetrying(Exception error)
         {
             var status = (error as HttpRequestException)?.StatusCode;
 
             return status == null
                    || (int)status >= 500
+                   || status == HttpStatusCode.NotFound
                    || status == HttpStatusCode.TooManyRequests
                    || status == HttpStatusCode.RequestTimeout;
         }

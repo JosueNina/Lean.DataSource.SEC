@@ -1582,6 +1582,17 @@ namespace QuantConnect.DataLibrary.Tests
                 _ => throw Blocked(), _ => throw Blocked()));
         }
 
+        [TestCase(HttpStatusCode.NotFound, true)]
+        [TestCase(HttpStatusCode.ServiceUnavailable, true)]
+        [TestCase(HttpStatusCode.TooManyRequests, true)]
+        [TestCase(HttpStatusCode.Forbidden, false)]
+        public void OnlyABlockIsNotAskedAgain(HttpStatusCode status, bool retried)
+        {
+            // Every file requested is one the SEC lists, so a 404 is a hiccup worth asking again: a
+            // filing in the 24 July 2026 index answered 404 during a rebuild and 200 afterwards.
+            Assert.AreEqual(retried, SEC13FDownloader.IsWorthRetrying(new HttpRequestException("", null, status)));
+        }
+
         [Test]
         public void AnEdgarListingYieldsItsNames()
         {
