@@ -77,7 +77,6 @@ namespace QuantConnect.DataLibrary.Tests
                 }
 
                 Globals.Reset();
-                SecurityDefinitionSymbolResolver.Reset();
                 _configSeeded = false;
             }
 
@@ -1226,7 +1225,6 @@ namespace QuantConnect.DataLibrary.Tests
             Config.Set("data-folder", dataFolder);
             Config.Set("map-file-provider-lookup-date", $"{lookupDate:yyyyMMdd}");
             Globals.Reset();
-            SecurityDefinitionSymbolResolver.Reset();
         }
 
         // ---- N-PORT ticker normalisation ----------------------------------------------------------
@@ -1299,6 +1297,82 @@ namespace QuantConnect.DataLibrary.Tests
             };
 
             Assert.IsNull(downloader.ResolveThroughTicker("067901108"));
+        }
+
+        // ---- security database rows repeated across lineages ----------------------------------------
+
+        [Test]
+        public void ACusipOnSeveralDatabaseRowsResolvesToTheRowCarryingTheIsinItBuilds()
+        {
+            // The security database repeats Alcoa's CUSIP on the old Alcoa, which trades as Howmet today and
+            // carries Howmet's ISIN, and on the Alcoa spun off in 2016. LEAN's resolver takes the first row, so
+            // the new Alcoa's holders went to Howmet's lineage. Both rows trade on the date; the one carrying the
+            // ISIN the CUSIP builds is the security the CUSIP names.
+            var oldAlcoa = SecurityIdentifier.GenerateEquity(new DateTime(1998, 1, 2), "AA", Market.USA);
+            var newAlcoa = SecurityIdentifier.GenerateEquity(new DateTime(2016, 11, 1), "AA", Market.USA);
+            SeedMapFileRows(
+                ("hwm", new[] { "19980102,aa", "20161031,aa", "20200331,arnc", "20501231,hwm" }),
+                ("aa", new[] { "20161101,aa", "20501231,aa" }));
+            SeedSecurityDatabase(
+                $"{oldAlcoa},01387210,,,US4432011082,4281",
+                $"{newAlcoa},01387210,,,US0138721065,1675149");
+
+            using var downloader = Downloader();
+
+            Assert.AreEqual(newAlcoa, downloader.ResolveSecurity("013872106", new DateTime(2022, 11, 14)));
+        }
+
+        [Test]
+        public void ACusipWhoseFirstDatabaseRowNoLongerTradesResolvesToTheRowThatDoes()
+        {
+            // TG Therapeutics' CUSIP and ISIN sit on its current listing and on the one it had as Atlantic
+            // Technology Ventures, whose map file ends in 2005. The first row names a security with no ticker
+            // since, so every TG holder was dropped as belonging to a ticker another security owned.
+            var atlantic = SecurityIdentifier.GenerateEquity(new DateTime(1998, 1, 2), "ATLC", Market.USA);
+            var tg = SecurityIdentifier.GenerateEquity(new DateTime(2012, 10, 1), "TGTX", Market.USA);
+            SeedMapFileRows(
+                ("mhan", new[] { "19980102,atlc", "20040630,atlc", "20051230,mhan" }),
+                ("tgtx", new[] { "20121001,tgtx", "20501231,tgtx" }));
+            SeedSecurityDatabase(
+                $"{atlantic},88322Q10,,,US88322Q1085,",
+                $"{tg},88322Q10,,,US88322Q1085,1001316");
+
+            using var downloader = Downloader();
+
+            Assert.AreEqual(tg, downloader.ResolveSecurity("88322Q108", new DateTime(2025, 2, 14)));
+        }
+
+        [Test]
+        public void ACusipWhoseDatabaseRowsAllStoppedTradingFallsThroughToTheCrosswalk()
+        {
+            // A row that no longer trades used to end the search: its security was dropped later as the owner
+            // of no ticker, and the N-PORT crosswalk, which knew the CUSIP, was never asked.
+            var cusip = "12345678" + SEC13FDownloader.ComputeCusipCheckDigit("12345678");
+            var dead = SecurityIdentifier.GenerateEquity(new DateTime(1998, 1, 2), "OLDCO", Market.USA);
+            var live = SecurityIdentifier.GenerateEquity(new DateTime(2015, 3, 2), "NEWCO", Market.USA);
+            SeedMapFileRows(
+                ("oldco", new[] { "19980102,oldco", "20101231,oldco" }),
+                ("newco", new[] { "20150302,newco", "20501231,newco" }));
+            SeedSecurityDatabase($"{dead},12345678,,,,");
+
+            using var downloader = Downloader();
+            downloader.TickerCrosswalk = new Dictionary<string, SEC13FTickerCrosswalk.Entry>
+            {
+                [cusip] = new("NEWCO", new DateTime(2025, 7, 1))
+            };
+
+            Assert.AreEqual(live, downloader.ResolveSecurity(cusip, new DateTime(2025, 11, 14)));
+        }
+
+        /// <summary>
+        /// Writes the security database the downloader reads at construction into the seeded data folder,
+        /// rows as the real file has them: SID, CUSIP without its check digit, FIGI, SEDOL, ISIN and CIK.
+        /// </summary>
+        private void SeedSecurityDatabase(params string[] rows)
+        {
+            var folder = Path.Combine(_root, "data", "symbol-properties");
+            Directory.CreateDirectory(folder);
+            File.WriteAllLines(Path.Combine(folder, "security-database.csv"), rows);
         }
 
         [TestCase("BRK.B", true)]

@@ -154,7 +154,11 @@ namespace QuantConnect.DataProcessing
         private readonly RateGate _rateGate = new(10, TimeSpan.FromSeconds(1));
 
         private readonly IMapFileProvider _mapFileProvider;
-        private readonly SecurityDefinitionSymbolResolver _symbolResolver;
+
+        // The security database's rows by CUSIP body and by ISIN, every row kept, since the database
+        // repeats identifiers across the listings one company has had. See TradingDefinition.
+        private readonly Dictionary<string, List<SecurityDefinition>> _definitionsByCusip;
+        private readonly Dictionary<string, List<SecurityDefinition>> _definitionsByIsin;
 
         /// <summary>
         /// CUSIP and filing date to security, misses included, since each miss scans the whole
@@ -286,21 +290,22 @@ namespace QuantConnect.DataProcessing
             _mapFileProvider = new LocalZipMapFileProvider();
             _mapFileProvider.Initialize(new DefaultDataProvider());
 
-            // The resolver takes its map file provider from the Composer, so both are registered first.
-            var dataProvider = new DefaultDataProvider();
-            Composer.Instance.AddPart<IDataProvider>(dataProvider);
-            Composer.Instance.AddPart(_mapFileProvider);
-            _symbolResolver = SecurityDefinitionSymbolResolver.GetInstance(dataProvider);
-
             // Without security-database.csv, which is not distributable, the first two resolution
             // steps answer nothing, so say so at startup rather than let the coverage drop silently.
+            // Its rows are read here rather than through LEAN's resolver, which keeps only the first
+            // row of an identifier the database repeats.
             var securityDatabasePath = Path.Combine(
                 Globals.GetDataFolderPath("symbol-properties"), "security-database.csv");
-            if (!File.Exists(securityDatabasePath))
+            if (!File.Exists(securityDatabasePath) ||
+                !SecurityDefinition.TryRead(new DefaultDataProvider(), securityDatabasePath, out var definitions))
             {
-                Log.Error($"SEC13FDownloader(): {securityDatabasePath} is missing. It is not distributable, " +
+                Log.Error($"SEC13FDownloader(): {securityDatabasePath} is missing or unreadable. It is not distributable, " +
                           "and without it no CUSIP or ISIN resolves and the run produces no data.");
+                definitions = new List<SecurityDefinition>();
             }
+
+            _definitionsByCusip = IndexDefinitions(definitions, definition => DatabaseCusip(definition.CUSIP));
+            _definitionsByIsin = IndexDefinitions(definitions, definition => definition.ISIN);
 
             _closePrices = new SEC13FClosePrices(Path.Combine(Globals.DataFolder, "equity", "usa", "fundamental", "coarse"));
             if (!_closePrices.Available)
@@ -1564,7 +1569,7 @@ namespace QuantConnect.DataProcessing
         /// Resolves a CUSIP to a security, point in time: by CUSIP, then by the US ISIN built from
         /// it, then through the N-PORT ticker crosswalk.
         /// </summary>
-        private SecurityIdentifier ResolveSecurity(string rawCusip, DateTime tradingDate)
+        internal SecurityIdentifier ResolveSecurity(string rawCusip, DateTime tradingDate)
         {
             var key = (rawCusip, tradingDate);
             if (_resolvedCusips.TryGetValue(key, out var cached))
@@ -1589,8 +1594,9 @@ namespace QuantConnect.DataProcessing
             }
 
             // Step 1: LEAN stores the CUSIP without its check digit, so the ninth character comes off.
-            var symbol = _symbolResolver.CUSIP(cusip.Substring(0, 8), tradingDate);
-            if (symbol != null)
+            var isin = BuildUnitedStatesIsin(cusip);
+            var security = TradingDefinition(_definitionsByCusip, cusip.Substring(0, 8), isin, tradingDate);
+            if (security != null)
             {
                 if (firstSighting)
                 {
@@ -1600,8 +1606,8 @@ namespace QuantConnect.DataProcessing
             else
             {
                 // Step 2: the US ISIN reaches issuers whose CUSIP is blank in the security database.
-                symbol = _symbolResolver.ISIN(BuildUnitedStatesIsin(cusip), tradingDate);
-                if (symbol != null && firstSighting)
+                security = TradingDefinition(_definitionsByIsin, isin, isin, tradingDate);
+                if (security != null && firstSighting)
                 {
                     _resolvedByIsin++;
                 }
@@ -1609,7 +1615,7 @@ namespace QuantConnect.DataProcessing
 
             // Step 3: the N-PORT crosswalk needs no security database, and reaches Alphabet and the
             // CINS foreign issuers the constructed ISIN cannot represent.
-            if (symbol == null)
+            if (security == null)
             {
                 var identifier = ResolveThroughTicker(cusip);
                 if (identifier != null)
@@ -1629,8 +1635,85 @@ namespace QuantConnect.DataProcessing
                 return null;
             }
 
-            _resolvedCusips[key] = symbol.ID;
-            return symbol.ID;
+            _resolvedCusips[key] = security;
+            return security;
+        }
+
+        /// <summary>
+        /// The security, among the database rows carrying an identifier, that trades under its own
+        /// ticker on the date, or null. The database repeats identifiers across the listings one
+        /// company has had, and LEAN's resolver takes the first row, mostly the one that no longer
+        /// trades: Alcoa's CUSIP sits on the old Alcoa, now Howmet, and on the Alcoa spun off in 2016,
+        /// and TG Therapeutics' on the listing it had as Atlantic Technology Ventures. Run on the real
+        /// database that dropped Alcoa, Howmet, Vertiv and TG Therapeutics, as groups whose ticker
+        /// another security owned. A row carrying the ISIN the CUSIP builds is tried first, since the
+        /// old Alcoa row carries Howmet's.
+        /// </summary>
+        private SecurityIdentifier TradingDefinition(Dictionary<string, List<SecurityDefinition>> rowsByIdentifier,
+            string identifier, string isin, DateTime tradingDate)
+        {
+            if (!rowsByIdentifier.TryGetValue(identifier, out var rows))
+            {
+                return null;
+            }
+
+            int Priority(SecurityDefinition row) => row.ISIN == null ? 1
+                : string.Equals(row.ISIN, isin, StringComparison.OrdinalIgnoreCase) ? 0 : 2;
+
+            foreach (var row in rows.OrderBy(Priority))
+            {
+                var ticker = ResolveTicker(row.SecurityIdentifier, tradingDate);
+                if (ticker != null && TickerOwner(ticker, tradingDate) == row.SecurityIdentifier.ToString())
+                {
+                    return row.SecurityIdentifier;
+                }
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// The security database rows by one identifier, in file order. A CUSIP is keyed by its eight
+        /// character body, the form the database mostly stores; the few rows written with their check
+        /// digit are keyed only when that digit holds.
+        /// </summary>
+        private static Dictionary<string, List<SecurityDefinition>> IndexDefinitions(
+            IEnumerable<SecurityDefinition> definitions, Func<SecurityDefinition, string> identifier)
+        {
+            var index = new Dictionary<string, List<SecurityDefinition>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var definition in definitions)
+            {
+                var key = identifier(definition);
+                if (string.IsNullOrWhiteSpace(key))
+                {
+                    continue;
+                }
+
+                if (!index.TryGetValue(key, out var rows))
+                {
+                    index[key] = rows = new List<SecurityDefinition>();
+                }
+
+                rows.Add(definition);
+            }
+
+            return index;
+        }
+
+        /// <summary>The eight character body of a database CUSIP, or null when it is neither that nor a checked nine.</summary>
+        private static string DatabaseCusip(string cusip)
+        {
+            if (cusip == null)
+            {
+                return null;
+            }
+
+            return cusip.Length switch
+            {
+                8 => cusip,
+                9 when ComputeCusipCheckDigit(cusip.Substring(0, 8)) == cusip[8] => cusip.Substring(0, 8),
+                _ => null
+            };
         }
 
         /// <summary>

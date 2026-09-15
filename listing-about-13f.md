@@ -142,7 +142,9 @@ identifier from the source is shipped. The resolution runs in three steps, each 
 one before it could not reach:
 
 1. The CUSIP itself, looked up in LEAN's security database. On its own it accounts for 76.1 percent
-   of the reported value.
+   of the reported value. The database repeats some identifiers across the listings one company has
+   had, such as the old and the new Alcoa, so every row carrying the CUSIP is tried and the one
+   trading under its own ticker on the filing date is kept.
 2. The US ISIN, built arithmetically from the same CUSIP. It reaches issuers whose CUSIP column in
    that database is blank and lifts the two steps together to 88.9 percent of value.
 3. The ticker the SEC's own Form N-PORT filings report for the CUSIP, taken back to a `Symbol`
