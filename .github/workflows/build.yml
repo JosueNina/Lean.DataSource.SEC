@@ -37,7 +37,12 @@ jobs:
           path: Lean
 
       - name: Move Lean
-        run: mv Lean ../Lean
+        # The runners are self-hosted and ../Lean sits outside the checkout, so it survives
+        # between runs. Left in place, mv moves into it instead of renaming, and the step
+        # fails on whichever runner has already built this repo once.
+        run: |
+          rm -rf ../Lean
+          mv Lean ../Lean
 
       - name: Run build and tests
         run: |
