@@ -30,12 +30,12 @@ namespace QuantConnect.DataLibrary.Tests
     /// widely held names.
     ///
     /// The universe file is keyed by the release date rather than by the reported quarter, so a
-    /// single selection call mixes filings covering several different quarters. PeriodEnd says
-    /// which quarter each record describes, and it typically sits 45 to 135 days behind the day the
-    /// record arrives, with late amendments arriving years later. That lag is the product, not a
-    /// defect.
+    /// single selection call mixes filings covering several different quarters. Each security
+    /// arrives as one record carrying its live quarters together, and PeriodEnd says which quarter
+    /// a reading describes: it typically sits 45 to 135 days behind the day the record arrives,
+    /// with late amendments arriving years later. That lag is the product, not a defect.
     /// </summary>
-    public class SEC13FHoldingsUniverseSelectionAlgorithm : QCAlgorithm
+    public class SEC13FUniverseSelectionAlgorithm : QCAlgorithm
     {
         /// <summary>Number of names held at a time.</summary>
         private const int BasketSize = 5;
@@ -58,29 +58,27 @@ namespace QuantConnect.DataLibrary.Tests
             SetEndDate(2020, 12, 31);
             SetCash(100000);
 
-            AddUniverse<SEC13FHoldingsUniverse>(data =>
+            AddUniverse<SEC13FUniverse>(data =>
             {
                 // Holders counts distinct filer CIKs, so it ranks names by how broadly institutions
                 // own them rather than by how much money one large manager put in.
                 //
-                // A security can appear twice on the same day: the quarter that has finished
-                // filling in and the one still filling. The dataset ships both on purpose and
-                // leaves the choice here, which is why every row carries its own PeriodEnd and
-                // Holders. Keeping the row with more holders keeps the more complete picture,
-                // which is what a breadth ranking wants. An algorithm chasing the freshest read
-                // instead would keep the later PeriodEnd.
-                var selected = (from SEC13FHoldingsUniverse datum in data
-                                where datum.Holders.HasValue
-                                group datum by datum.Symbol into security
-                                select security.OrderByDescending(datum => datum.Holders.Value).First())
-                    .OrderByDescending(datum => datum.Holders.Value)
-                    .ThenBy(datum => datum.Symbol.Value)
+                // Every security arrives once, with the quarter that has finished filling in and
+                // the one still filling travelling together in Holdings. MostReported is the one
+                // more managers have reported, which is the more complete picture and what a
+                // breadth ranking wants. An algorithm chasing the freshest read would take Latest.
+                var selected = (from SEC13F datum in data
+                                let quarter = datum.MostReported
+                                where quarter.Holders.HasValue
+                                orderby quarter.Holders.Value descending, datum.Symbol.Value
+                                select datum)
                     .Take(BasketSize)
                     .ToList();
 
                 foreach (var datum in selected)
                 {
-                    Log($"{datum.Symbol.Value} - Period: {datum.PeriodEnd:yyyy-MM-dd}, Holders: {datum.Holders}, HoldingValue: {datum.HoldingValue}");
+                    var quarter = datum.MostReported;
+                    Log($"{datum.Symbol.Value} - Period: {quarter.Quarter} ({quarter.PeriodEnd:yyyy-MM-dd}), Holders: {quarter.Holders}, HoldingValue: {quarter.HoldingValue}");
                 }
 
                 return selected.Select(datum => datum.Symbol);

@@ -15,7 +15,7 @@ from AlgorithmImports import *
 from QuantConnect.DataSource import *
 
 
-class SEC13FHoldingsAlgorithm(QCAlgorithm):
+class SEC13FAlgorithm(QCAlgorithm):
     '''Example algorithm using the SEC Form 13F institutional holdings dataset as a source of alpha.
     It subscribes the dataset on three large, long-listed US equities, reads the aggregated
     institutional position on each (number of reporting managers, shares held and their market
@@ -37,7 +37,7 @@ class SEC13FHoldingsAlgorithm(QCAlgorithm):
         # Tradeable equity symbol, keyed by the 13F data symbol subscribed on it.
         self._equity_by_data_symbol = {}
 
-        # Latest number of institutional holders per reported quarter, keyed by equity symbol.
+        # Latest institutional breadth per equity, read off the most complete quarter.
         self._holders_by_equity = {}
 
         self._invested = None
@@ -48,39 +48,39 @@ class SEC13FHoldingsAlgorithm(QCAlgorithm):
         # whole identity chain rather than just its first step.
         for ticker in ["AAPL", "GOOGL", "SPY"]:
             equity = self.add_equity(ticker, Resolution.DAILY).symbol
-            data_symbol = self.add_data(SEC13FHoldings, equity).symbol
+            data_symbol = self.add_data(SEC13F, equity).symbol
             self._equity_by_data_symbol[data_symbol] = equity
 
     def on_data(self, slice: Slice) -> None:
-        # One filing date can carry several reported quarters of the same security, and the Slice
-        # keeps one point per symbol, so slice.get would hand over only the newest quarter.
-        # all_data carries every one of them.
-        for holding in slice.all_data:
-            if not isinstance(holding, SEC13FHoldings) or holding.holders is None:
-                continue
-            equity = self._equity_by_data_symbol.get(holding.symbol)
-            if equity is None:
+        for data_symbol, equity in self._equity_by_data_symbol.items():
+            if data_symbol not in slice:
                 continue
 
-            # time is when the point was published, 03:00 ET the day after the filing date, and
-            # period_end the quarter the numbers describe, typically 45 to 135 days earlier. Every
-            # value is cumulative for period_end: it counts every manager that had reported the
-            # security by then.
-            self.log(f"{self.time:%Y-%m-%d} {equity.value} - Period: {holding.period_end:%Y-%m-%d}, Holders: {holding.holders}, Shares: {holding.shares}, HoldingValue: {holding.holding_value}")
+            # A release can restate several quarters of the same security at once and the point
+            # carries every one of them, so indexing the Slice by symbol loses nothing.
+            point = slice[data_symbol]
 
-            self._holders_by_equity.setdefault(equity, {})[holding.period_end] = holding.holders
+            # time is when the point was published, 03:00 ET the day after the filing date, while
+            # period_end is the quarter a reading describes, typically 45 to 135 days earlier.
+            # Every value is cumulative for its own period_end: it counts every manager that had
+            # reported the security for that quarter by the publication time.
+            for holding in point.holdings:
+                self.log(f"{self.time:%Y-%m-%d} {equity.value} - Period: {holding.quarter} ({holding.period_end:%Y-%m-%d}), Holders: {holding.holders}, Shares: {holding.shares}, HoldingValue: {holding.holding_value}")
+
+            # most_reported is the quarter the most managers have reported, so a new quarter that is
+            # still filling in cannot hide the finished one it replaces: the same rule the universe
+            # file applies. An algorithm chasing the freshest read would take latest.
+            most_reported = point.most_reported
+            if most_reported.holders is not None:
+                self._holders_by_equity[equity] = most_reported.holders
 
         if not self._holders_by_equity:
             return
 
-        # Hold the name the most institutions report. Breadth is the larger of the two newest
-        # quarters, so a quarter that is still filling in does not hide the finished one: the same
-        # rule the universe file applies. Rebalancing only when the leader changes keeps the demo
-        # down to a handful of orders.
-        def breadth(quarters):
-            return max(quarters[period] for period in sorted(quarters)[-2:])
-
-        leader = sorted(self._holders_by_equity.items(), key=lambda kvp: (-breadth(kvp[1]), kvp[0].value))[0][0]
+        # Hold the name the most institutions report. Rebalancing only when the leader changes keeps
+        # the demo down to a handful of orders.
+        leader = sorted(self._holders_by_equity.items(),
+                        key=lambda kvp: (-kvp[1], kvp[0].value))[0][0]
 
         # A 13F point lands before the open on the day after its filing, which is not necessarily a
         # day the equity prints a bar, so the order waits for a price rather than firing against a

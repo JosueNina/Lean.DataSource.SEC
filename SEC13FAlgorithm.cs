@@ -13,7 +13,6 @@
  * limitations under the License.
 */
 
-using System;
 using System.Linq;
 using System.Collections.Generic;
 using QuantConnect.Data;
@@ -32,14 +31,13 @@ namespace QuantConnect.DataLibrary.Tests
     /// The 13F symbols returned by AddData are signals, not tradeable securities, so every name is
     /// added twice: once as the tradeable equity and once as the custom data subscribed on it.
     /// </summary>
-    public class SEC13FHoldingsAlgorithm : QCAlgorithm
+    public class SEC13FAlgorithm : QCAlgorithm
     {
         /// <summary>Tradeable equity symbol, keyed by the 13F data symbol subscribed on it.</summary>
         private readonly Dictionary<Symbol, Symbol> _equityByDataSymbol = new Dictionary<Symbol, Symbol>();
 
-        /// <summary>Latest number of institutional holders per reported quarter, keyed by equity symbol.</summary>
-        private readonly Dictionary<Symbol, SortedDictionary<DateTime, decimal>> _holdersByEquity =
-            new Dictionary<Symbol, SortedDictionary<DateTime, decimal>>();
+        /// <summary>Latest institutional breadth per equity, read off the most complete quarter.</summary>
+        private readonly Dictionary<Symbol, decimal> _holdersByEquity = new Dictionary<Symbol, decimal>();
 
         private Symbol _invested;
 
@@ -64,7 +62,7 @@ namespace QuantConnect.DataLibrary.Tests
             foreach (var ticker in new[] { "AAPL", "GOOGL", "SPY" })
             {
                 var equity = AddEquity(ticker, Resolution.Daily).Symbol;
-                var dataSymbol = AddData<SEC13FHoldings>(equity).Symbol;
+                var dataSymbol = AddData<SEC13F>(equity).Symbol;
                 _equityByDataSymbol[dataSymbol] = equity;
             }
         }
@@ -75,28 +73,35 @@ namespace QuantConnect.DataLibrary.Tests
         /// <param name="slice">Slice object keyed by symbol containing the data</param>
         public override void OnData(Slice slice)
         {
-            // One filing date can carry several reported quarters of the same security, and the
-            // Slice keeps one point per symbol, so slice.Get would hand over only the newest quarter.
-            // AllData carries every one of them.
-            foreach (var holding in slice.AllData.OfType<SEC13FHoldings>())
+            foreach (var kvp in _equityByDataSymbol)
             {
-                if (!_equityByDataSymbol.TryGetValue(holding.Symbol, out var equity) || !holding.Holders.HasValue)
+                if (!slice.ContainsKey(kvp.Key))
                 {
                     continue;
                 }
 
-                // Time is when the point was published, 03:00 ET the day after the filing date, and
-                // PeriodEnd the quarter the numbers describe, typically 45 to 135 days earlier. Every
-                // value is cumulative for PeriodEnd: it counts every manager that had reported the
-                // security by then.
-                Log($"{Time:yyyy-MM-dd} {equity.Value} - Period: {holding.PeriodEnd:yyyy-MM-dd}, Holders: {holding.Holders}, Shares: {holding.Shares}, HoldingValue: {holding.HoldingValue}");
+                // A release can restate several quarters of the same security at once and the point
+                // carries every one of them, so indexing the Slice by symbol loses nothing.
+                SEC13F point = slice[kvp.Key];
+                var equity = kvp.Value;
 
-                if (!_holdersByEquity.TryGetValue(equity, out var quarters))
+                // Time is when the point was published, 03:00 ET the day after the filing date,
+                // while PeriodEnd is the quarter a reading describes, typically 45 to 135 days
+                // earlier. Every value is cumulative for its own PeriodEnd: it counts every manager
+                // that had reported the security for that quarter by the publication time.
+                foreach (var holding in point.Holdings)
                 {
-                    _holdersByEquity[equity] = quarters = new SortedDictionary<DateTime, decimal>();
+                    Log($"{Time:yyyy-MM-dd} {equity.Value} - Period: {holding.Quarter} ({holding.PeriodEnd:yyyy-MM-dd}), Holders: {holding.Holders}, Shares: {holding.Shares}, HoldingValue: {holding.HoldingValue}");
                 }
 
-                quarters[holding.PeriodEnd] = holding.Holders.Value;
+                // MostReported is the quarter the most managers have reported, so a new quarter that
+                // is still filling in cannot hide the finished one it replaces: the same rule the
+                // universe file applies. An algorithm chasing the freshest read would take Latest.
+                var mostReported = point.MostReported;
+                if (mostReported.Holders.HasValue)
+                {
+                    _holdersByEquity[equity] = mostReported.Holders.Value;
+                }
             }
 
             if (_holdersByEquity.Count == 0)
@@ -104,12 +109,10 @@ namespace QuantConnect.DataLibrary.Tests
                 return;
             }
 
-            // Hold the name the most institutions report. Breadth is the larger of the two newest
-            // quarters, so a quarter that is still filling in does not hide the finished one: the
-            // same rule the universe file applies. Rebalancing only when the leader changes keeps
-            // the demo down to a handful of orders.
+            // Hold the name the most institutions report. Rebalancing only when the leader changes
+            // keeps the demo down to a handful of orders.
             var leader = _holdersByEquity
-                .OrderByDescending(kvp => kvp.Value.Values.Reverse().Take(2).Max())
+                .OrderByDescending(kvp => kvp.Value)
                 .ThenBy(kvp => kvp.Key.Value)
                 .First()
                 .Key;

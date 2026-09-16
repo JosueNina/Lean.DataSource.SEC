@@ -11,10 +11,10 @@
     <Content Include="..\SECReportBenchmarkAlgorithm.py" Link="SECReportBenchmarkAlgorithm.py" />
     <Compile Include="..\SECReportDataAlgorithm.cs" Link="SECReportDataAlgorithm.cs" />
     <Content Include="..\SECReportDataAlgorithm.py" Link="SECReportDataAlgorithm.py" />
-    <Compile Include="..\SEC13FHoldingsAlgorithm.cs" Link="SEC13FHoldingsAlgorithm.cs" />
-    <Content Include="..\SEC13FHoldingsAlgorithm.py" Link="SEC13FHoldingsAlgorithm.py" />
-    <Compile Include="..\SEC13FHoldingsUniverseSelectionAlgorithm.cs" Link="SEC13FHoldingsUniverseSelectionAlgorithm.cs" />
-    <Content Include="..\SEC13FHoldingsUniverseSelectionAlgorithm.py" Link="SEC13FHoldingsUniverseSelectionAlgorithm.py" />
+    <Compile Include="..\SEC13FAlgorithm.cs" Link="SEC13FAlgorithm.cs" />
+    <Content Include="..\SEC13FAlgorithm.py" Link="SEC13FAlgorithm.py" />
+    <Compile Include="..\SEC13FUniverseSelectionAlgorithm.cs" Link="SEC13FUniverseSelectionAlgorithm.cs" />
+    <Content Include="..\SEC13FUniverseSelectionAlgorithm.py" Link="SEC13FUniverseSelectionAlgorithm.py" />
     <Content Include="TestData\sec_report_raw_single.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>

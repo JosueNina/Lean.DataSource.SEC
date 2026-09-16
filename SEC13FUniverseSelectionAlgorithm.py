@@ -15,16 +15,17 @@ from AlgorithmImports import *
 from QuantConnect.DataSource import *
 
 
-class SEC13FHoldingsUniverseSelectionAlgorithm(QCAlgorithm):
+class SEC13FUniverseSelectionAlgorithm(QCAlgorithm):
     '''Example algorithm demonstrating universe selection over the SEC Form 13F institutional
     holdings dataset: on every release date it ranks the cross-section by the number of
     institutional managers reporting each security and holds an equal-weight basket of the most
     widely held names.
 
     The universe file is keyed by the release date rather than by the reported quarter, so a single
-    selection call mixes filings covering several different quarters. period_end says which quarter
-    each record describes, and it typically sits 45 to 135 days behind the day the record arrives,
-    with late amendments arriving years later. That lag is the product, not a defect.'''
+    selection call mixes filings covering several different quarters. Each security arrives as one
+    record carrying its live quarters together, and period_end says which quarter a reading
+    describes: it typically sits 45 to 135 days behind the day the record arrives, with late
+    amendments arriving years later. That lag is the product, not a defect.'''
 
     # Number of names held at a time.
     BASKET_SIZE = 5
@@ -43,29 +44,23 @@ class SEC13FHoldingsUniverseSelectionAlgorithm(QCAlgorithm):
         self._selected = []
         self._rebalance = False
 
-        self.add_universe(SEC13FHoldingsUniverse, self._select)
+        self.add_universe(SEC13FUniverse, self._select)
 
-    def _select(self, data: List[SEC13FHoldingsUniverse]) -> List[Symbol]:
+    def _select(self, data: List[SEC13F]) -> List[Symbol]:
         # holders counts distinct filer CIKs, so it ranks names by how broadly institutions own
         # them rather than by how much money one large manager put in.
-        # A security can appear twice on the same day: the quarter that has finished filling in
-        # and the one still filling. The dataset ships both on purpose and leaves the choice here,
-        # which is why every row carries its own period_end and holders. Keeping the row with more
-        # holders keeps the more complete picture, which is what a breadth ranking wants. An
-        # algorithm chasing the freshest read instead would keep the later period_end.
-        best = {}
-        for datum in data:
-            if datum.holders is None:
-                continue
-            held = best.get(datum.symbol)
-            if held is None or datum.holders > held.holders:
-                best[datum.symbol] = datum
-
-        selected = sorted(best.values(),
-                          key=lambda datum: (-datum.holders, datum.symbol.value))[:self.BASKET_SIZE]
+        # Every security arrives once, with the quarter that has finished filling in and the one
+        # still filling travelling together in holdings. most_reported is the one more managers
+        # have reported, which is the more complete picture and what a breadth ranking wants. An
+        # algorithm chasing the freshest read would take latest.
+        ranked = [datum for datum in data if datum.most_reported.holders is not None]
+        selected = sorted(ranked,
+                          key=lambda datum: (-datum.most_reported.holders,
+                                             datum.symbol.value))[:self.BASKET_SIZE]
 
         for datum in selected:
-            self.log(f"{datum.symbol.value} - Period: {datum.period_end:%Y-%m-%d}, Holders: {datum.holders}, HoldingValue: {datum.holding_value}")
+            quarter = datum.most_reported
+            self.log(f"{datum.symbol.value} - Period: {quarter.quarter} ({quarter.period_end:%Y-%m-%d}), Holders: {quarter.holders}, HoldingValue: {quarter.holding_value}")
 
         return [datum.symbol for datum in selected]
 

@@ -11,10 +11,11 @@ deadline and a long tail of late filers and amendments.
 
 The reporting lag is the product, not an inconvenience to be hidden. A position is typically 45 to
 135 days old by the time it reaches the public record, with late amendments arriving years later,
-so a data point is stamped with the moment it was published and carries the quarter it reports in
-`PeriodEnd`. Measured across 11,761 filings in one window, the lag from the reported quarter end to
-the filing date runs minimum 0 days, p10 16, median 42, p90 48, maximum 6,596, with 10.4 percent of
-filings arriving later than the 45 day deadline. Delivering a position on the quarter end it
+so a data point is stamped with the moment it was published and carries every quarter that release
+restated, each with its own `PeriodEnd`. Measured across 11,761 filings in one window, the lag from
+the reported quarter end to the filing date runs minimum 0 days, p10 16, median 42, p90 48,
+maximum 6,596, with 10.4 percent of filings arriving later than the 45 day deadline.
+Delivering a position on the quarter end it
 describes would inject every day of that gap as look-ahead, so LEAN delivers it when the dataset
 could first publish it: EDGAR lists a day's filings at about 22:05 ET, the daily job reads them after
 midnight, and every row is stamped at 03:00 ET the day after its filing date, before the market
@@ -26,6 +27,14 @@ fifty different days, so a data point counts every filing for that quarter that 
 timestamp rather than only the ones made that day. Reading Apple on the busiest day of the March
 2026 quarter gives 5,920 reporting managers and 9,097,811,804 shares, not the 602 managers who
 reported it for the first time that day.
+
+One release can restate several quarters of the same security at once, because late filings and
+amendments keep arriving, so a data point carries them all in `Holdings`, one reading per reported
+quarter, oldest first. Seven percent of the points in the history carry more than one, up to 75.
+Shipping a point per quarter instead would have lost all but one of them, since LEAN delivers a
+single data point per security per timestamp. `MostReported` picks the quarter the most managers
+have reported, which during a quarter handover is the finished quarter rather than the thin new one,
+and `Latest` picks the newest.
 
 ## About the Provider
 
@@ -44,11 +53,11 @@ asks of all automated readers.
 
 ```python
 self._symbol = self.add_equity("AAPL", Resolution.DAILY).symbol
-self._holdings_symbol = self.add_data(SEC13FHoldings, self._symbol).symbol
+self._holdings_symbol = self.add_data(SEC13F, self._symbol).symbol
 ```
 ```csharp
 _symbol = AddEquity("AAPL", Resolution.Daily).Symbol;
-_holdingsSymbol = AddData<SEC13FHoldings>(_symbol).Symbol;
+_holdingsSymbol = AddData<SEC13F>(_symbol).Symbol;
 ```
 
 ## Data Summary
@@ -73,14 +82,16 @@ The history begins on 2013-05-20, the first filing date in the SEC structured da
 archive covers the second quarter of 2013. Anything earlier exists only as raw filings in the EDGAR
 full index and is not part of this dataset.
 
-Each data point carries the following fields, all summed across the managers that reported the
-security:
+Each reading in a data point's `Holdings` carries the following fields, all summed across the
+managers that reported the security for that quarter:
 
 | Property | Meaning |
 | --- | --- |
+| `PeriodEnd` | End of the quarter the positions are reported for, the SEC PERIODOFREPORT |
+| `Quarter` | The same quarter as a sortable label such as `2020Q2`, derived from `PeriodEnd` |
 | `Holders` | Number of distinct managers, counted by filer CIK, that have reported the security |
 | `Shares` | Shares held, summed over lines with share type SH and no option flag |
-| `HoldingValue` | Market value of those same lines as reported by the managers, and the data point's `Value` |
+| `HoldingValue` | Market value of those same lines as reported by the managers; the `MostReported` reading's is the data point's `Value` |
 | `CallShares` | Shares underlying reported call positions |
 | `PutShares` | Shares underlying reported put positions |
 | `PrincipalValue` | Principal amount of debt instruments reported for the security, share type PRN |

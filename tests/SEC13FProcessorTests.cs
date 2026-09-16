@@ -760,9 +760,9 @@ namespace QuantConnect.DataLibrary.Tests
         {
             // The job hands the destination over empty. Files an earlier run left there would be read
             // into the universe and published again, so a run refuses to start on top of them.
-            var destination = Path.Combine(_root, "out", SEC13FHoldings.ReportFolder);
+            var destination = Path.Combine(_root, "out", SEC13F.ReportFolder);
             Directory.CreateDirectory(destination);
-            File.WriteAllText(Path.Combine(destination, "aapl.csv"), "20240214 17:30,20231231,1,1,1,0,0,0,0,0,0");
+            File.WriteAllText(Path.Combine(destination, "aapl.csv"), "20240214 17:30,1,20231231,1,1,1,0,0,0,0,0,0");
 
             using var downloader = Downloader();
 
@@ -856,7 +856,7 @@ namespace QuantConnect.DataLibrary.Tests
             // would add a second time, so it stops instead of guessing.
             var shelf = ShelfWithFilerState();
             File.Delete(Path.Combine(shelf, "edgar-days.txt"));
-            File.WriteAllLines(Path.Combine(shelf, "aapl.csv"), new[] { "20240215 03:00,20231231,1,5,50,0,0,0,0,0,0" });
+            File.WriteAllLines(Path.Combine(shelf, "aapl.csv"), new[] { "20240215 03:00,1,20231231,1,5,50,0,0,0,0,0,0" });
 
             using var downloader = new SEC13FDownloader(
                 Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 9));
@@ -901,7 +901,7 @@ namespace QuantConnect.DataLibrary.Tests
             var processed = ShelfWithFilerState();
             File.WriteAllLines(Path.Combine(processed, "aapl.csv"), new[]
             {
-                "20240215 17:30,20231231,1,5,50,0,0,0,0,0,0"
+                "20240215 17:30,1,20231231,1,5,50,0,0,0,0,0,0"
             });
 
             using var downloader = new SEC13FDownloader(
@@ -917,11 +917,11 @@ namespace QuantConnect.DataLibrary.Tests
             // the summed columns can, so a run that cannot read the state would count every filer in
             // tonight's archive again on top of the existing history. The file would keep its shape
             // and only that one column would be wrong, which is what this refuses to publish.
-            var processed = Path.Combine(_root, "processed", SEC13FHoldings.ReportFolder);
+            var processed = Path.Combine(_root, "processed", SEC13F.ReportFolder);
             Directory.CreateDirectory(processed);
             File.WriteAllLines(Path.Combine(processed, "aapl.csv"), new[]
             {
-                "20240215 17:30,20231231,1,5,50,0,0,0,0,0,0"
+                "20240215 17:30,1,20231231,1,5,50,0,0,0,0,0,0"
             });
 
             using var downloader = new SEC13FDownloader(
@@ -961,10 +961,10 @@ namespace QuantConnect.DataLibrary.Tests
             // The shelf is what the next run reads and the publish step is what puts this run's
             // output there, so the round trip goes through that move rather than reading the output
             // in place.
-            var shelf = Path.Combine(_root, "processed", SEC13FHoldings.ReportFolder);
+            var shelf = Path.Combine(_root, "processed", SEC13F.ReportFolder);
             Directory.CreateDirectory(shelf);
             File.Copy(
-                Path.Combine(_root, "out", SEC13FHoldings.ReportFolder, "filers.zip"),
+                Path.Combine(_root, "out", SEC13F.ReportFolder, "filers.zip"),
                 Path.Combine(shelf, "filers.zip"), overwrite: true);
 
             using var second = new SEC13FDownloader(
@@ -987,7 +987,7 @@ namespace QuantConnect.DataLibrary.Tests
             // the delivery archive look changed on every run when nothing in it had moved.
             var security = Security("AAPL");
             var quarter = new DateTime(2023, 12, 31);
-            var path = Path.Combine(_root, "out", SEC13FHoldings.ReportFolder, "filers.zip");
+            var path = Path.Combine(_root, "out", SEC13F.ReportFolder, "filers.zip");
 
             using (var first = Downloader())
             {
@@ -1015,7 +1015,7 @@ namespace QuantConnect.DataLibrary.Tests
             // packed keys, whose indexes come from that first sighting, the same filers came out in
             // a different order: the incremental republished all 58 million of them unchanged and
             // filers.zip still changed bytes.
-            var path = Path.Combine(_root, "out", SEC13FHoldings.ReportFolder, "filers.zip");
+            var path = Path.Combine(_root, "out", SEC13F.ReportFolder, "filers.zip");
             var apple = Security("AAPL");
             var microsoft = Security("MSFT");
             var december = new DateTime(2023, 12, 31);
@@ -1063,10 +1063,10 @@ namespace QuantConnect.DataLibrary.Tests
                 seed.WriteFilerState();
             }
 
-            var shelf = Path.Combine(_root, "processed", SEC13FHoldings.ReportFolder);
+            var shelf = Path.Combine(_root, "processed", SEC13F.ReportFolder);
             Directory.CreateDirectory(shelf);
             File.Copy(
-                Path.Combine(_root, "out", SEC13FHoldings.ReportFolder, "filers.zip"),
+                Path.Combine(_root, "out", SEC13F.ReportFolder, "filers.zip"),
                 Path.Combine(shelf, "filers.zip"), overwrite: true);
             File.WriteAllText(Path.Combine(shelf, "edgar-days.txt"), "#from 20260601\n20260601\n");
             return shelf;
@@ -1085,13 +1085,14 @@ namespace QuantConnect.DataLibrary.Tests
             // point where it stops adding anything. ExtractAlphaTrueBeats ships every live fiscal
             // period the same way rather than choosing between them.
             var universe = BuildUniverse(
-                // Holders is the fourth column of the published row, right after the quarter.
-                "20231101 17:30,20230930,1500,100,1000,0,0,0,0,0,0",
-                "20240201 17:30,20231231,5,10,100,0,0,0,0,0,0",
-                "20240415 17:30,20240331,3,7,70,0,0,0,0,0,0",
-                "20240516 17:30,20240331,9,20,200,0,0,0,0,0,0",
+                // One release per line: the stamp, how many quarters it restates, and then that
+                // many groups. Holders is the second column of a group, right after the quarter.
+                "20231101 17:30,1,20230930,1500,100,1000,0,0,0,0,0,0",
+                "20240201 17:30,1,20231231,5,10,100,0,0,0,0,0,0",
+                "20240415 17:30,1,20240331,3,7,70,0,0,0,0,0,0",
+                "20240516 17:30,1,20240331,9,20,200,0,0,0,0,0,0",
                 // An amendment for a quarter that has already been retired.
-                "20240603 17:30,20230930,1600,110,1100,0,0,0,0,0,0");
+                "20240603 17:30,1,20230930,1600,110,1100,0,0,0,0,0,0");
 
             // Only the finished quarter exists yet.
             Assert.AreEqual(new[] { "20230930" }, universe["20231101"]);
@@ -1109,6 +1110,48 @@ namespace QuantConnect.DataLibrary.Tests
             // current file. Its own release-date row still exists in the per-security file, so
             // nothing is lost by ignoring it here.
             Assert.AreEqual(new[] { "20240331" }, universe["20240603"]);
+        }
+
+        // ---- One line per release, and one line per security ---------------------------------------
+
+        [Test]
+        public void ASecuritysLiveQuartersTravelInOneUniverseLine()
+        {
+            // Both views carry every quarter of a release in a single line, because LEAN hands an
+            // algorithm one data point per security per timestamp and drops the rest. The per
+            // security line here restates two quarters at once, and the universe has to unpack it
+            // into its quarters and pack the live ones back into the security's own line, carrying
+            // the columns across unchanged so that the two views cannot disagree.
+            SeedMapFiles("aapl");
+
+            var holdings = Path.Combine(_root, "out", SEC13F.ReportFolder);
+            Directory.CreateDirectory(holdings);
+            File.WriteAllLines(Path.Combine(holdings, "aapl.csv"), new[]
+            {
+                "20240201 17:30,2," +
+                "20230930,1500,100,1000,0,0,0,0,0,1," +
+                "20231231,5,10,100,0,0,0,0,0,0"
+            });
+
+            using (var downloader = Downloader())
+            {
+                downloader.BuildUniverseFiles();
+            }
+
+            var lines = File.ReadAllLines(Path.Combine(holdings, "universe", "20240201.csv"))
+                .Where(line => line.Length > 0)
+                .ToList();
+
+            Assert.AreEqual(1, lines.Count, "one line per security, however many quarters it carries");
+
+            var csv = lines[0].Split(',');
+            Assert.AreEqual(ListedSince1980("aapl").ToString(), csv[0]);
+            Assert.AreEqual("AAPL", csv[1]);
+            Assert.AreEqual("2", csv[2], "both live quarters travel together");
+            Assert.AreEqual("20230930,1500,100,1000,0,0,0,0,0,1", string.Join(",", csv.Skip(3).Take(10)),
+                "the finished quarter, oldest first and column for column");
+            Assert.AreEqual("20231231,5,10,100,0,0,0,0,0,0", string.Join(",", csv.Skip(13).Take(10)),
+                "then the one filling in behind it");
         }
 
         // ---- Delisted securities and the universe's shelf life ----------------------------------
@@ -1158,16 +1201,16 @@ namespace QuantConnect.DataLibrary.Tests
                 ("stale", new[] { "19801212,stale", "20501231,stale" }),
                 ("gone", new[] { "19801212,gone", "20240305,gone" }));
 
-            var holdings = Path.Combine(_root, "out", SEC13FHoldings.ReportFolder);
+            var holdings = Path.Combine(_root, "out", SEC13F.ReportFolder);
             Directory.CreateDirectory(holdings);
             File.WriteAllLines(Path.Combine(holdings, "aapl.csv"), new[]
             {
-                "20240201 17:30,20231231,5,10,100,0,0,0,0,0,0",
-                "20240415 17:30,20240331,6,12,120,0,0,0,0,0,0",
-                "20240520 17:30,20240331,7,14,140,0,0,0,0,0,0"
+                "20240201 17:30,1,20231231,5,10,100,0,0,0,0,0,0",
+                "20240415 17:30,1,20240331,6,12,120,0,0,0,0,0,0",
+                "20240520 17:30,1,20240331,7,14,140,0,0,0,0,0,0"
             });
-            File.WriteAllLines(Path.Combine(holdings, "stale.csv"), new[] { "20240201 17:30,20231231,1,1,1,0,0,0,0,0,0" });
-            File.WriteAllLines(Path.Combine(holdings, "gone.csv"), new[] { "20240202 17:30,20231231,2,2,2,0,0,0,0,0,0" });
+            File.WriteAllLines(Path.Combine(holdings, "stale.csv"), new[] { "20240201 17:30,1,20231231,1,1,1,0,0,0,0,0,0" });
+            File.WriteAllLines(Path.Combine(holdings, "gone.csv"), new[] { "20240202 17:30,1,20231231,2,2,2,0,0,0,0,0,0" });
 
             using (var downloader = Downloader())
             {
@@ -1849,7 +1892,7 @@ namespace QuantConnect.DataLibrary.Tests
             SeedMapFiles("aapl");
 
             var destination = Path.Combine(_root, "out");
-            var holdings = Path.Combine(destination, SEC13FHoldings.ReportFolder);
+            var holdings = Path.Combine(destination, SEC13F.ReportFolder);
             Directory.CreateDirectory(holdings);
             File.WriteAllLines(Path.Combine(holdings, "aapl.csv"), rows);
 
@@ -1863,12 +1906,26 @@ namespace QuantConnect.DataLibrary.Tests
 
             return Directory.GetFiles(universe, "*.csv").ToDictionary(
                 Path.GetFileNameWithoutExtension,
-                // Column two is PeriodEnd: sid, ticker, then the quarter.
                 file => File.ReadAllLines(file)
                     .Where(line => line.Length > 0)
-                    .Select(line => line.Split(',')[2])
+                    .SelectMany(QuartersOf)
                     .OrderBy(period => period, StringComparer.Ordinal)
                     .ToArray());
+        }
+
+        /// <summary>
+        /// The quarters one universe line carries: the identifier and the ticker, then how many
+        /// quarters follow and that many groups, each of them starting with its reported quarter.
+        /// The group width is read from the line rather than assumed, the way the data type reads it.
+        /// </summary>
+        private static IEnumerable<string> QuartersOf(string line)
+        {
+            const int identifierColumns = 3;
+            var csv = line.Split(',');
+            var quarters = int.Parse(csv[2], System.Globalization.CultureInfo.InvariantCulture);
+            var width = (csv.Length - identifierColumns) / quarters;
+
+            return Enumerable.Range(0, quarters).Select(quarter => csv[identifierColumns + quarter * width]);
         }
 
         /// <summary>

@@ -1,4 +1,4 @@
-/*
+﻿/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
  *
@@ -84,7 +84,7 @@ namespace QuantConnect.DataProcessing
         // index at 01:00 ET the next day with a one hour timeout (schedule "0 1 * * 2-6", Date
         // Offset 1), so a filing is published the day after its FILING_DATE at ReleaseTimeOfDay.
         // Stamping it any earlier would let a backtest read it before the live job had it.
-        internal static readonly TimeSpan AvailableAfterFilingDate = TimeSpan.FromDays(1) + SEC13FHoldings.ReleaseTimeOfDay;
+        internal static readonly TimeSpan AvailableAfterFilingDate = TimeSpan.FromDays(1) + SEC13F.ReleaseTimeOfDay;
 
         /// <summary>Config key that starts the rebuild's EDGAR days on this yyyyMMdd instead of after the last data set.</summary>
         internal const string EdgarFromKey = "sec-13f-edgar-from";
@@ -108,10 +108,16 @@ namespace QuantConnect.DataProcessing
         private const string ReleaseFormat = "yyyyMMdd HH:mm";
         private const string PeriodFormat = "yyyyMMdd";
 
-        // The published row: release, period, the eight measures and the confidential flag.
+        // A staged row: release, period, the eight measures and the confidential flag.
         private const int FirstValueColumn = 2;
         private const int ValueColumnCount = 8;
         private const int PublishedColumnCount = FirstValueColumn + ValueColumnCount + 1;
+
+        // A published line: the release stamp, how many quarters it restates, and then that many
+        // groups of columns, one per quarter. Every quarter a release restates travels in one line,
+        // since LEAN hands an algorithm a single data point per security per timestamp.
+        private const int PointHeaderColumns = 2;
+        private const int GroupColumnCount = ValueColumnCount + 2;
 
         // N-PORT quarters folded into the crosswalk: a year reaches every security still trading.
         private const int NPortQuartersToFold = 4;
@@ -272,15 +278,15 @@ namespace QuantConnect.DataProcessing
         {
             // The folder comes from the data type rather than a literal, so the writer and the
             // reader cannot drift apart.
-            _destinationDirectory = Path.Combine(destinationDirectory, SEC13FHoldings.ReportFolder);
-            _processedDataDirectory = Path.Combine(processedDataDirectory, SEC13FHoldings.ReportFolder);
+            _destinationDirectory = Path.Combine(destinationDirectory, SEC13F.ReportFolder);
+            _processedDataDirectory = Path.Combine(processedDataDirectory, SEC13F.ReportFolder);
             _deploymentDate = deploymentDate;
 
             // Downloads land in the raw folder, which the job archives after every run but does not
             // restore before the next, so it only saves work within a run.
             _archiveCacheDirectory = rawDataDirectory == null
                 ? Path.Combine(Path.GetTempPath(), "sec-13f-archives")
-                : Path.Combine(rawDataDirectory, SEC13FHoldings.ReportFolder, "archives");
+                : Path.Combine(rawDataDirectory, SEC13F.ReportFolder, "archives");
             Directory.CreateDirectory(_archiveCacheDirectory);
 
             _client = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
@@ -290,19 +296,13 @@ namespace QuantConnect.DataProcessing
             _mapFileProvider = new LocalZipMapFileProvider();
             _mapFileProvider.Initialize(new DefaultDataProvider());
 
-            // Without security-database.csv, which is not distributable, the first two resolution
-            // steps answer nothing, so say so at startup rather than let the coverage drop silently.
-            // Its rows are read here rather than through LEAN's resolver, which keeps only the first
-            // row of an identifier the database repeats.
+            // The security database is in place wherever the job runs, as the map files are. Its rows are
+            // read here rather than through LEAN's resolver, which keeps only the first row of an
+            // identifier the database repeats; a data folder without it, as in the unit tests, reads as empty.
             var securityDatabasePath = Path.Combine(
                 Globals.GetDataFolderPath("symbol-properties"), "security-database.csv");
-            if (!File.Exists(securityDatabasePath) ||
-                !SecurityDefinition.TryRead(new DefaultDataProvider(), securityDatabasePath, out var definitions))
-            {
-                Log.Error($"SEC13FDownloader(): {securityDatabasePath} is missing or unreadable. It is not distributable, " +
-                          "and without it no CUSIP or ISIN resolves and the run produces no data.");
-                definitions = new List<SecurityDefinition>();
-            }
+            SecurityDefinition.TryRead(new DefaultDataProvider(), securityDatabasePath, out var definitions);
+            definitions ??= new List<SecurityDefinition>();
 
             _definitionsByCusip = IndexDefinitions(definitions, definition => DatabaseCusip(definition.CUSIP));
             _definitionsByIsin = IndexDefinitions(definitions, definition => definition.ISIN);
@@ -2099,10 +2099,13 @@ namespace QuantConnect.DataProcessing
                 }
 
                 // Time order: LEAN's SubscriptionDataReader silently drops a point whose timestamp
-                // moves backwards. Ties keep the older quarter first.
+                // moves backwards. The quarters of one release are written oldest first, inside the
+                // single line that carries them.
                 File.WriteAllLines(
                     Path.Combine(_destinationDirectory, $"{ticker}.csv"),
-                    rows.OrderBy(row => row.Time).ThenBy(row => row.PeriodEnd).Select(FormatRow));
+                    rows.OrderBy(row => row.Time).ThenBy(row => row.PeriodEnd)
+                        .GroupBy(row => row.Time)
+                        .Select(release => FormatPoint(release.Key, release.ToList())));
             }
 
             // The shelf row count is what tells a merge from a silent rebuild, so it is logged.
@@ -2135,7 +2138,7 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
-                rows.AddRange(ReadRows(path)
+                rows.AddRange(ReadPublishedRows(path)
                     .Where(row => TickerOwner(ticker, row.Time.Date) == security)
                     .Select(row => (ticker, row)));
             }
@@ -2157,7 +2160,7 @@ namespace QuantConnect.DataProcessing
                 return new List<HoldingsRow>();
             }
 
-            var rows = ReadRows(path)
+            var rows = ReadPublishedRows(path)
                 .Where(row =>
                 {
                     var owner = TickerOwner(ticker, row.Time.Date);
@@ -2227,16 +2230,18 @@ namespace QuantConnect.DataProcessing
                         }
 
                         var csv = line.Split(',');
-                        if (csv.Length < PublishedColumnCount ||
-                            !DateTime.TryParseExact(csv[1], PeriodFormat, CultureInfo.InvariantCulture,
-                                DateTimeStyles.None, out var periodEnd))
+                        if (csv.Length < PointHeaderColumns + GroupColumnCount ||
+                            !int.TryParse(csv[1], NumberStyles.Integer, CultureInfo.InvariantCulture,
+                                out var quarters) ||
+                            quarters <= 0 ||
+                            !DateTime.TryParseExact(csv[0], ReleaseFormat, CultureInfo.InvariantCulture,
+                                DateTimeStyles.None, out var release))
                         {
                             malformed++;
                             continue;
                         }
 
-                        var releaseDate = DateTime
-                            .ParseExact(csv[0], ReleaseFormat, CultureInfo.InvariantCulture).Date;
+                        var releaseDate = release.Date;
 
                         // The owner of the ticker on the release date. The map file is checked first
                         // because GenerateEquity never returns null for an unknown ticker.
@@ -2257,13 +2262,26 @@ namespace QuantConnect.DataProcessing
                             events[releaseDate] = rows = new List<UniverseRow>();
                         }
 
-                        // The per-security row is carried unchanged, so the two views cannot disagree.
-                        rows.Add(new UniverseRow(
-                            security.ToString(),
-                            periodEnd,
-                            ParseDecimal(csv[FirstValueColumn]),
-                            mapFile.DelistingDate,
-                            $"{security},{ticker},{string.Join(",", csv.Skip(1))}"));
+                        var width = (csv.Length - PointHeaderColumns) / quarters;
+                        for (var quarter = 0; quarter < quarters; quarter++)
+                        {
+                            var offset = PointHeaderColumns + quarter * width;
+                            if (!DateTime.TryParseExact(csv[offset], PeriodFormat, CultureInfo.InvariantCulture,
+                                    DateTimeStyles.None, out var periodEnd))
+                            {
+                                malformed++;
+                                continue;
+                            }
+
+                            // The published columns are carried unchanged, so the two views cannot disagree.
+                            rows.Add(new UniverseRow(
+                                security.ToString(),
+                                periodEnd,
+                                ParseDecimal(csv[offset + 1]),
+                                mapFile.DelistingDate,
+                                ticker,
+                                string.Join(",", csv.Skip(offset).Take(width))));
+                        }
                     }
                 }
             }
@@ -2354,10 +2372,11 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
-                // Security, then quarter.
+                // One line per security, its quarters oldest first, securities in identifier
+                // order. LEAN hands the selection function a single record per security.
                 var rows = current
                     .OrderBy(security => security.Key, StringComparer.Ordinal)
-                    .SelectMany(security => security.Value.Values.Select(row => row.Line))
+                    .Select(security => FormatUniverseLine(security.Key, security.Value.Values))
                     .ToList();
 
                 File.WriteAllLines(Path.Combine(universeDirectory, $"{day.ToStringInvariant("yyyyMMdd")}.csv"), rows);
@@ -2369,7 +2388,7 @@ namespace QuantConnect.DataProcessing
                       $"from {events.Keys.First():yyyy-MM-dd} to {events.Keys.Last():yyyy-MM-dd}, " +
                       $"{current.Count} securities and " +
                       $"{current.Values.Sum(periods => periods.Count)} rows in the last file, " +
-                      $"{rowsWritten} rows written, {superseded} restated, " +
+                      $"{rowsWritten} lines written, {superseded} restated, " +
                       $"{ignoredAsStale} late rows ignored as stale, {expiredQuarters} quarters expired, " +
                       $"{delistedSecurities} securities delisted");
         }
@@ -2410,9 +2429,29 @@ namespace QuantConnect.DataProcessing
             return new DateTime(day.Year, (day.Month - 1) / 3 * 3 + 1, 1).AddDays(-1);
         }
 
-        /// <summary>One universe line, with the fields the forward-fill reads kept alongside it.</summary>
+        /// <summary>
+        /// One universe line: the identifier, the ticker the security traded under when its newest
+        /// quarter was published, and that quarter and the one before it, oldest first.
+        /// </summary>
+        private static string FormatUniverseLine(string security, IList<UniverseRow> quarters)
+        {
+            var line = new StringBuilder()
+                .Append(security).Append(',')
+                .Append(quarters[quarters.Count - 1].Ticker).Append(',')
+                .Append(quarters.Count.ToStringInvariant());
+
+            foreach (var quarter in quarters)
+            {
+                line.Append(',').Append(quarter.Group);
+            }
+
+            return line.ToString();
+        }
+
+        /// <summary>One quarter of a universe line, with the fields the forward-fill reads.</summary>
         private readonly record struct UniverseRow(
-            string SecurityIdentifier, DateTime PeriodEnd, decimal Holders, DateTime DelistingDate, string Line);
+            string SecurityIdentifier, DateTime PeriodEnd, decimal Holders, DateTime DelistingDate,
+            string Ticker, string Group);
 
         /// <summary>One row of a per-security file, either an increment or the running total.</summary>
         internal sealed class HoldingsRow
@@ -2470,7 +2509,29 @@ namespace QuantConnect.DataProcessing
                 .ToList();
         }
 
-        /// <summary>Reads a per-security file, skipping blank lines.</summary>
+        /// <summary>Reads a published per-security file, unpacking every release into its quarters.</summary>
+        private static IEnumerable<HoldingsRow> ReadPublishedRows(string path)
+        {
+            return File.ReadAllLines(path)
+                .Where(line => !string.IsNullOrWhiteSpace(line))
+                .SelectMany(ParsePoint);
+        }
+
+        /// <summary>Unpacks one published line into one row per quarter it restates.</summary>
+        private static IEnumerable<HoldingsRow> ParsePoint(string line)
+        {
+            var csv = line.Split(',');
+            var time = DateTime.ParseExact(csv[0], ReleaseFormat, CultureInfo.InvariantCulture);
+            var quarters = int.Parse(csv[1], NumberStyles.Integer, CultureInfo.InvariantCulture);
+            var width = (csv.Length - PointHeaderColumns) / quarters;
+
+            for (var quarter = 0; quarter < quarters; quarter++)
+            {
+                yield return ParseGroup(time, csv, PointHeaderColumns + quarter * width);
+            }
+        }
+
+        /// <summary>Reads a staging file, skipping blank lines.</summary>
         private static IEnumerable<HoldingsRow> ReadRows(string path)
         {
             return File.ReadAllLines(path).Where(line => !string.IsNullOrWhiteSpace(line)).Select(ParseRow);
@@ -2546,38 +2607,63 @@ namespace QuantConnect.DataProcessing
             return cumulative;
         }
 
-        /// <summary>Parses one per-security row.</summary>
+        /// <summary>Parses one staged row.</summary>
         private static HoldingsRow ParseRow(string line)
         {
             var csv = line.Split(',');
+            return ParseGroup(DateTime.ParseExact(csv[0], ReleaseFormat, CultureInfo.InvariantCulture), csv, 1);
+        }
+
+        /// <summary>Reads one quarter: the period, the eight measures and the confidential flag.</summary>
+        private static HoldingsRow ParseGroup(DateTime time, string[] csv, int offset)
+        {
             var values = new decimal[ValueColumnCount];
             for (var i = 0; i < ValueColumnCount; i++)
             {
-                values[i] = ParseDecimal(csv[FirstValueColumn + i]);
+                values[i] = ParseDecimal(csv[offset + 1 + i]);
             }
 
             return new HoldingsRow
             {
-                Time = DateTime.ParseExact(csv[0], ReleaseFormat, CultureInfo.InvariantCulture),
-                PeriodEnd = DateTime.ParseExact(csv[1], PeriodFormat, CultureInfo.InvariantCulture),
+                Time = time,
+                PeriodEnd = DateTime.ParseExact(csv[offset], PeriodFormat, CultureInfo.InvariantCulture),
                 Values = values,
-                ConfidentialOmitted = csv[FirstValueColumn + ValueColumnCount] == "1"
+                ConfidentialOmitted = csv[offset + 1 + ValueColumnCount] == "1"
             };
         }
 
-        /// <summary>Formats one per-security row, in the layout SEC13FHoldings parses.</summary>
+        /// <summary>Formats one staged row: the release stamp and the quarter behind it.</summary>
         private static string FormatRow(HoldingsRow row)
         {
+            return $"{row.Time.ToStringInvariant(ReleaseFormat)},{FormatGroup(row)}";
+        }
+
+        /// <summary>Formats one release, in the layout SEC13F parses.</summary>
+        private static string FormatPoint(DateTime time, IList<HoldingsRow> quarters)
+        {
             var line = new StringBuilder()
-                .Append(row.Time.ToStringInvariant(ReleaseFormat)).Append(',')
-                .Append(row.PeriodEnd.ToStringInvariant(PeriodFormat));
+                .Append(time.ToStringInvariant(ReleaseFormat)).Append(',')
+                .Append(quarters.Count.ToStringInvariant());
+
+            foreach (var row in quarters)
+            {
+                line.Append(',').Append(FormatGroup(row));
+            }
+
+            return line.ToString();
+        }
+
+        /// <summary>Formats one quarter of a release, in the layout SEC13FHolding parses.</summary>
+        private static string FormatGroup(HoldingsRow row)
+        {
+            var group = new StringBuilder().Append(row.PeriodEnd.ToStringInvariant(PeriodFormat));
 
             foreach (var value in row.Values)
             {
-                line.Append(',').Append(FormatValue(value));
+                group.Append(',').Append(FormatValue(value));
             }
 
-            return line.Append(',').Append(row.ConfidentialOmitted ? '1' : '0').ToString();
+            return group.Append(',').Append(row.ConfidentialOmitted ? '1' : '0').ToString();
         }
 
         /// <summary>Reports how much of the dataset made it through identity resolution.</summary>
