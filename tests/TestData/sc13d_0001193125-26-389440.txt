@@ -1,0 +1,219 @@
+<SEC-DOCUMENT>0001193125-26-389440.txt : 20260911
+<SEC-HEADER>0001193125-26-389440.hdr.sgml : 20260911
+<ACCEPTANCE-DATETIME>20260911173717
+ACCESSION NUMBER:		0001193125-26-389440
+CONFORMED SUBMISSION TYPE:	SCHEDULE 13D
+PUBLIC DOCUMENT COUNT:		1
+FILED AS OF DATE:		20260911
+DATE AS OF CHANGE:		20260911
+
+SUBJECT COMPANY:	
+
+	COMPANY DATA:	
+		COMPANY CONFORMED NAME:			American Homes 4 Rent
+		CENTRAL INDEX KEY:			0001562401
+		STANDARD INDUSTRIAL CLASSIFICATION:	REAL ESTATE INVESTMENT TRUSTS [6798]
+		ORGANIZATION NAME:           	05 Real Estate & Construction
+		EIN:				461229660
+		STATE OF INCORPORATION:			MD
+		FISCAL YEAR END:			1231
+
+	FILING VALUES:
+		FORM TYPE:		SCHEDULE 13D
+		SEC ACT:		1934 Act
+		SEC FILE NUMBER:	005-87581
+		FILM NUMBER:		261375337
+
+	BUSINESS ADDRESS:	
+		STREET 1:		280 PILOT ROAD
+		CITY:			LAS VEGAS
+		STATE:			NV
+		ZIP:			89119
+		BUSINESS PHONE:		(805) 413-5300
+
+	MAIL ADDRESS:	
+		STREET 1:		280 PILOT ROAD
+		CITY:			LAS VEGAS
+		STATE:			NV
+		ZIP:			89119
+
+FILED BY:		
+
+	COMPANY DATA:	
+		COMPANY CONFORMED NAME:			GUSTAVSON TAMARA HUGHES
+		CENTRAL INDEX KEY:			0001322750
+		ORGANIZATION NAME:           	
+
+	FILING VALUES:
+		FORM TYPE:		SCHEDULE 13D
+
+	MAIL ADDRESS:	
+		STREET 1:		701 WESTERN AVENUE
+		CITY:			GLENDALE
+		STATE:			CA
+		ZIP:			91201-2349
+</SEC-HEADER>
+<DOCUMENT>
+<TYPE>SCHEDULE 13D
+<SEQUENCE>1
+<FILENAME>primary_doc.xml
+<TEXT>
+<XML>
+<?xml version="1.0" encoding="UTF-8"?><edgarSubmission xmlns="http://www.sec.gov/edgar/schedule13D" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <schemaVersion>X0202</schemaVersion>
+<headerData>
+    <submissionType>SCHEDULE 13D</submissionType>
+    <filerInfo>
+      <filer>
+        <filerCredentials>
+          <cik>0001322750</cik>
+          <ccc>XXXXXXXX</ccc>
+        </filerCredentials>
+      </filer>
+      <liveTestFlag>LIVE</liveTestFlag>
+
+
+
+    </filerInfo>
+  </headerData>
+  <formData>
+    <coverPageHeader>
+      <securitiesClassTitle>Class A common shares of beneficial interest, $0.01 par value per share </securitiesClassTitle>
+      <dateOfEvent>09/11/2026</dateOfEvent>
+      <previouslyFiledFlag>false</previouslyFiledFlag>
+      <issuerInfo>
+        <issuerCIK>0001562401</issuerCIK>
+        <issuerCusips>
+          <issuerCusipNumber>02665T306</issuerCusipNumber>
+        </issuerCusips>
+        <issuerName>American Homes 4 Rent</issuerName>
+        <address>
+          <street1 xmlns="http://www.sec.gov/edgar/common">280 Pilot Road</street1>
+          <city xmlns="http://www.sec.gov/edgar/common">Las Vegas</city>
+          <stateOrCountry xmlns="http://www.sec.gov/edgar/common">NV</stateOrCountry>
+          <zipCode xmlns="http://www.sec.gov/edgar/common">89119</zipCode>
+        </address>
+      </issuerInfo>
+      <authorizedPersons>
+        <notificationInfo>
+          <personName>David Goldberg</personName>
+          <personPhoneNum>(310) 774-5332</personPhoneNum>
+          <personAddress>
+            <street1 xmlns="http://www.sec.gov/edgar/common">22917 Pacific Coast Highway #300</street1>
+            <city xmlns="http://www.sec.gov/edgar/common">Malibu</city>
+            <stateOrCountry xmlns="http://www.sec.gov/edgar/common">CA</stateOrCountry>
+            <zipCode xmlns="http://www.sec.gov/edgar/common">90265</zipCode>
+          </personAddress>
+        </notificationInfo>
+      </authorizedPersons>
+    </coverPageHeader>
+    <reportingPersons>
+      <reportingPersonInfo>
+        <reportingPersonCIK>0001322750</reportingPersonCIK>
+        <reportingPersonNoCIK>N</reportingPersonNoCIK>
+        <reportingPersonName>Tamara Hughes Gustavson</reportingPersonName>
+        <fundType>PF</fundType>
+        <legalProceedings>N</legalProceedings>
+        <citizenshipOrOrganization>X1</citizenshipOrOrganization>
+        <soleVotingPower>21470184</soleVotingPower>
+        <sharedVotingPower>100</sharedVotingPower>
+        <soleDispositivePower>21470184</soleDispositivePower>
+        <sharedDispositivePower>100</sharedDispositivePower>
+        <aggregateAmountOwned>21470284</aggregateAmountOwned>
+        <isAggregateExcludeShares>N</isAggregateExcludeShares>
+        <percentOfClass>5.98</percentOfClass>
+        <typeOfReportingPerson>IN</typeOfReportingPerson>
+        <commentContent>(1)   The numbers in rows 7, 9 and 11 include shares indirectly beneficially owned and 5,421 restricted share units, each representing a contingent right to receive one Class A common share.
+(2)   The numbers in rows 8, 10 and 11 include shares held beneficially by spouse.
+(3)   Percentage of class based on number of shares outstanding at July 29, 2026.
+
+The Shares (as defined below) held by Tamara Hughes Gustavson (the "Reporting Person") reported on this Schedule 13D were previously reported on a Schedule 13D (the "Previous Report") filed with the Securities and Exchange Commission (the "SEC") by B. Wayne Hughes and the Reporting Person (collectively, the "Original Persons"). On September 11, 2026, the Original Persons filed an amendment to their Schedule 13D to report that they no longer constituted a "group" within the meaning of Section 13(d)(3) of the Securities Exchange Act of 1934, as amended (the "Exchange Act"). This Schedule 13D is being filed because the Reporting Person continues to be a reporting person for purposes of Schedule 13D.
+
+</commentContent>
+      </reportingPersonInfo>
+    </reportingPersons>
+    <items1To7>
+      <item1>
+        <securityTitle>Class A common shares of beneficial interest, $0.01 par value per share </securityTitle>
+        <issuerName>American Homes 4 Rent</issuerName>
+        <issuerPrincipalAddress>
+          <street1 xmlns="http://www.sec.gov/edgar/common">280 Pilot Road</street1>
+          <city xmlns="http://www.sec.gov/edgar/common">Las Vegas</city>
+          <stateOrCountry xmlns="http://www.sec.gov/edgar/common">NV</stateOrCountry>
+          <zipCode xmlns="http://www.sec.gov/edgar/common">89119</zipCode>
+        </issuerPrincipalAddress>
+      </item1>
+      <item2>
+        <filingPersonName>Tamara Hughes Gustavson</filingPersonName>
+        <principalBusinessAddress>884 Iron Works Pike, Lexington KY 40511
+</principalBusinessAddress>
+        <principalJob>The Reporting Person serves on the Board of Trustees of the Issuer. </principalJob>
+        <hasBeenConvicted>During the last five years, the Reporting Person has not been convicted in a criminal proceeding (excluding traffic violations or similar misdemeanors).</hasBeenConvicted>
+        <convictionDescription>During the last five years, the Reporting Person has not been a party to a civil proceeding of a judicial or administrative body of competent jurisdiction and as a result of such proceeding was or is subject to a judgment, decree or final order enjoining future violations of, or prohibiting or mandating activities subject to, federal or state securities laws or finding any violation with respect to such laws.</convictionDescription>
+        <citizenship>United States</citizenship>
+      </item2>
+      <item3>
+        <fundsSource>As of September 11, 2026, Ms. Tamara Hughes Gustavson owned a total of 21,470,284 Shares.
+
+The funds used for purchases, if any, of Shares beneficially owned by the Reporting Person were obtained from the Reporting Person's personal funds. As noted below, the sole purpose of this filing is to continue the Reporting Person's compliance with her reporting obligations which were previously satisfied by the Previous Report.
+</fundsSource>
+      </item3>
+      <item4>
+        <transactionPurpose>The purpose of the acquisition of Shares by the Reporting Person is for investment as part of the general investment portfolio of the Reporting Person. This Schedule 13D is being filed because the Reporting Person is no longer a member of a "group" within the meaning of Section 13(d)(3) of the Act, as disclosed in the explanatory note to this Schedule 13D. This filing is not being made as a result of any particular acquisition or disposition of securities by the Reporting Person.
+
+The Reporting Person intends to review her investments in the Issuer on a continuing basis and may, at any time, consistent with the Reporting Person's obligations under the federal securities laws, determine to increase or decrease her ownership of Shares through purchases or sales of Shares in the open market or in privately negotiated transactions. Such determination will depend on various factors, including the Issuer's business prospects, other developments concerning the Issuer, general economic conditions, money and stock market conditions, and any other facts and circumstances which may become known to the Reporting Person regarding her investments in the Issuer.
+
+By virtue of the purchase of the Shares, the Reporting Person has no plans or proposals which relate to or would result in (i) the acquisition by any person of additional securities of the Issuer, or the disposition of securities of the Issuer; (ii) an extraordinary corporate transaction, such as a merger, reorganization or liquidation, involving the Issuer or any of its subsidiaries; (iii) a sale or transfer of a material amount of assets of the Issuer or any of its subsidiaries; (iv) any change in the present board of trustees or management of the Issuer, including any plans or proposals to change the number or term of trustees or fill any existing vacancies on the board; (v) any material change in the present capitalization or dividend policy of the Issuer; (vi) any other material change in the Issuer's business or corporate structure; (vii) changes in the Issuer's charter or bylaws or other actions which may impede the acquisition or control of the Issuer by any person; (viii) causing a class of securities of the Issuer to be delisted from the national securities exchange or to cease to be authorized to be quoted in an inter-dealer quotation system of a registered national securities association; (ix) a class of equity securities of the Issuer becoming eligible for termination of registration pursuant to Section 12(d)(4) of the Act; or (x) any action similar to any of those described above.
+
+The Reporting Person is a trustee of the Issuer and, in her capacity as such, may, from time to time, propose to the Issuer's Board of Trustees a wide variety of types of transactions, including transactions similar to those described above.
+
+</transactionPurpose>
+      </item4>
+      <item5>
+        <percentageOfClassSecurities>The aggregate percentage of Shares reported beneficially owned by the Reporting Person is determined based upon 359,179,944 Shares outstanding as of July 29, 2026, as set forth in the Issuer's Quarterly Report on Form 10-Q for the quarter ended June 30, 2026. As of June 30, 2026, the Reporting Person beneficially owned 21,470,284 Shares, representing approximately 5.98% of the outstanding Shares.
+
+</percentageOfClassSecurities>
+        <numberOfShares>The aggregate percentage of Shares reported beneficially owned by the Reporting Person is determined based upon 359,179,944 Shares outstanding as of July 29, 2026, as set forth in the Issuer's Quarterly Report on Form 10-Q for the quarter ended June 30, 2026. As of June 30, 2026, the Reporting Person beneficially owned 21,470,284 Shares, representing approximately 5.98% of the outstanding Shares, which includes:
+
+        (1)    9,415,345 Shares (which includes 5,421 restricted share units, each representing a contingent right to receive one Share) held directly, of which the Reporting Person has sole voting and dispositive power;
+
+        (2)   11,621,725 Shares held by Tamara H. Gustavson Revocable Trust, of which the Reporting Person has sole voting and dispositive power;
+
+        (3)   158,780 Shares held by a custodian of an individual retirement account, of which the Reporting Person has sole voting and dispositive power;
+
+        (4)   100 Shares held by the Reporting Person's husband, of which the Reporting Person has shared voting and dispositive power; and
+
+        (5) 274,334 Shares held by THG AT, LLC, an LLC formed for the benefit of the Reporting Person and her family and of which the Reporting Person is manager and has sole voting and dispositive power</numberOfShares>
+        <transactionDesc>The Reporting Person has not effected any transactions in the Shares during the past sixty days.</transactionDesc>
+        <listOfShareholders>Except as disclosed herein, no other person is known to the Reporting Person to have the right to receive or the power to direct receipt of dividends from, or the proceeds from the sale of, Shares beneficially owned by the Reporting Person. </listOfShareholders>
+        <date5PercentOwnership>Not applicable.</date5PercentOwnership>
+      </item5>
+      <item6>
+        <contractDescription>Except as disclosed herein, to the best knowledge of the Reporting Person, there are at present no contracts, arrangements, understandings or relationships (legal or otherwise) between the Reporting Person and any person with respect to any securities of the Issuer, including but not limited to, transfer or voting of any of the securities of the Issuer, finder's fees, joint ventures, loan or option arrangements, puts or calls, guarantees of profits, division of profits or loss or the giving or withholding of proxies, or a pledge or contingency the occurrence of which would give another person voting power over securities of the Issuer.
+</contractDescription>
+      </item6>
+      <item7>
+        <filedExhibits>Exhibit A:      Power of Attorney, dated as of September 2, 2015 (incorporated by reference to Schedule 13D filed on September 2, 2015). </filedExhibits>
+      </item7>
+    </items1To7>
+    <signatureInfo>
+      <signaturePerson>
+        <signatureReportingPerson>Tamara Hughes Gustavson</signatureReportingPerson>
+        <signatureDetails>
+          <signature>*</signature>
+          <title>Tamara Hughes Gustavson</title>
+          <date>09/11/2026</date>
+        </signatureDetails>
+        <signatureDetails>
+          <signature>*/s/ David Goldberg</signature>
+          <title>David Goldberg/Attorney-in-fact</title>
+          <date>09/11/2026</date>
+        </signatureDetails>
+      </signaturePerson>
+    </signatureInfo>
+  </formData>
+</edgarSubmission>
+</XML>
+</TEXT>
+</DOCUMENT>
+</SEC-DOCUMENT>
