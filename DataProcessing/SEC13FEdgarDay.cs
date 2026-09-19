@@ -54,9 +54,23 @@ namespace QuantConnect.DataProcessing
             public DateTime Period { get; init; }
             public bool ConfidentialOmitted { get; init; }
 
-            /// <summary>INFOTABLE rows: CUSIP, VALUE, SSHPRNAMT, SSHPRNAMTTYPE, PUTCALL, VOTING_AUTH_SOLE, VOTING_AUTH_SHARED.</summary>
+            /// <summary>The cover page: the manager's name and what an amendment declares about itself.</summary>
+            public string ManagerName { get; init; }
+            public string AmendmentNumber { get; init; }
+            public string AmendmentType { get; init; }
+            public DateTime? DateReported { get; init; }
+
+            /// <summary>INFOTABLE rows, in the order of <see cref="LineColumns"/>.</summary>
             public List<string[]> Lines { get; } = new();
         }
+
+        private static readonly string[] LineColumns =
+        [
+            "CUSIP", "TITLEOFCLASS", "VALUE", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL", "INVESTMENTDISCRETION",
+            "OTHERMANAGER", "VOTING_AUTH_SOLE", "VOTING_AUTH_SHARED", "VOTING_AUTH_NONE"
+        ];
+
+        private const string XmlDateFormat = "MM-dd-yyyy";
 
         /// <summary>The name a day's archive is cached and logged under.</summary>
         public static string ArchiveName(DateTime day) => $"edgar-{day.ToString(DateFormat.EightCharacter, CultureInfo.InvariantCulture)}_form13f.zip";
@@ -81,7 +95,8 @@ namespace QuantConnect.DataProcessing
                 return null;
             }
 
-            var entries = ParseIndex(getText(SECEdgarIndex.IndexUrl(day)));
+            // The index lists a filing once for every CIK it names.
+            var entries = SECEdgarIndex.DistinctFilings(ParseIndex(getText(SECEdgarIndex.IndexUrl(day))));
             var filings = new List<Filing>(entries.Count);
             foreach (var entry in entries)
             {
@@ -106,8 +121,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Reads one full submission file: the period and confidential treatment flag from the
-        /// primary document, and every line of its information tables. The form type, filer and
+        /// Reads one full submission file: the period, the cover page and the confidential treatment
+        /// flag from the primary document, and every line of its information tables. The form type, filer and
         /// filing date come from the index, as they do in the data sets.
         /// </summary>
         internal static Filing ParseFiling(SECEdgarIndex.Entry entry, string text)
@@ -146,8 +161,16 @@ namespace QuantConnect.DataProcessing
                 SubmissionType = entry.FormType,
                 Cik = entry.Cik,
                 Filed = entry.Filed,
-                Period = DateTime.ParseExact(period, "MM-dd-yyyy", CultureInfo.InvariantCulture),
-                ConfidentialOmitted = IsTrue(Value(primary, "isConfidentialOmitted"))
+                Period = DateTime.ParseExact(period, XmlDateFormat, CultureInfo.InvariantCulture),
+                ConfidentialOmitted = IsTrue(Value(primary, "isConfidentialOmitted")),
+
+                // Scoped to the filing manager: the signature and the other managers carry a name too.
+                ManagerName = SECEdgarIndex.Elements(primary, "filingManager")
+                    .Select(manager => Value(manager, "name")).FirstOrDefault(),
+                AmendmentNumber = Value(primary, "amendmentNo"),
+                AmendmentType = Value(primary, "amendmentType"),
+                DateReported = DateTime.TryParseExact(Value(primary, "dateReported"), XmlDateFormat,
+                    CultureInfo.InvariantCulture, DateTimeStyles.None, out var reported) ? reported : null
             };
 
             foreach (var line in tables.SelectMany(table => SECEdgarIndex.Elements(table, "infoTable")))
@@ -155,24 +178,29 @@ namespace QuantConnect.DataProcessing
                 filing.Lines.Add(new[]
                 {
                     Value(line, "cusip"),
+                    Value(line, "titleOfClass"),
                     Value(line, "value"),
                     Value(line, "sshPrnamt"),
                     Value(line, "sshPrnamtType"),
                     Value(line, "putCall"),
+                    Value(line, "investmentDiscretion"),
+                    Value(line, "otherManager"),
                     Value(line, "Sole"),
-                    Value(line, "Shared")
+                    Value(line, "Shared"),
+                    Value(line, "None")
                 });
             }
 
             return filing;
         }
 
-        /// <summary>Writes the three tables the processor reads, in the data sets' layout.</summary>
+        /// <summary>Writes the four tables the processor reads, in the data sets' layout.</summary>
         internal static void WriteArchive(Stream stream, IEnumerable<Filing> filings)
         {
             var submissions = new StringBuilder("ACCESSION_NUMBER\tFILING_DATE\tSUBMISSIONTYPE\tCIK\tPERIODOFREPORT\n");
             var summaries = new StringBuilder("ACCESSION_NUMBER\tISCONFIDENTIALOMITTED\n");
-            var lines = new StringBuilder("ACCESSION_NUMBER\tCUSIP\tVALUE\tSSHPRNAMT\tSSHPRNAMTTYPE\tPUTCALL\tVOTING_AUTH_SOLE\tVOTING_AUTH_SHARED\n");
+            var covers = new StringBuilder("ACCESSION_NUMBER\tAMENDMENTNO\tAMENDMENTTYPE\tDATEREPORTED\tFILINGMANAGER_NAME\n");
+            var lines = new StringBuilder("ACCESSION_NUMBER\t").AppendJoin('\t', LineColumns).Append('\n');
 
             foreach (var filing in filings)
             {
@@ -180,6 +208,9 @@ namespace QuantConnect.DataProcessing
                     filing.Filed.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), filing.SubmissionType,
                     filing.Cik.ToString(CultureInfo.InvariantCulture), filing.Period.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))).Append('\n');
                 summaries.Append(filing.Accession).Append('\t').Append(filing.ConfidentialOmitted ? "Y" : "N").Append('\n');
+                covers.Append(string.Join('\t', filing.Accession, Clean(filing.AmendmentNumber), Clean(filing.AmendmentType),
+                    filing.DateReported?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? string.Empty,
+                    Clean(filing.ManagerName))).Append('\n');
 
                 foreach (var line in filing.Lines)
                 {
@@ -194,7 +225,7 @@ namespace QuantConnect.DataProcessing
             }
 
             using var zip = new ZipArchive(stream, ZipArchiveMode.Create, leaveOpen: true);
-            foreach (var (name, content) in new[] { ("SUBMISSION.tsv", submissions), ("SUMMARYPAGE.tsv", summaries), ("INFOTABLE.tsv", lines) })
+            foreach (var (name, content) in new[] { ("SUBMISSION.tsv", submissions), ("SUMMARYPAGE.tsv", summaries), ("COVERPAGE.tsv", covers), ("INFOTABLE.tsv", lines) })
             {
                 using var writer = new StreamWriter(zip.CreateEntry(name, CompressionLevel.Optimal).Open());
                 writer.Write(content.ToString());

@@ -61,6 +61,7 @@ namespace QuantConnect.DataLibrary.Tests
             }
 
             Globals.Reset();
+            Directory.Delete(_root, true);
         }
 
         [Test]

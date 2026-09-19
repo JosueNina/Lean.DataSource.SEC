@@ -21,7 +21,6 @@ using System.Reflection;
 using Newtonsoft.Json;
 using NUnit.Framework;
 using NUnit.Framework.Legacy;
-using ProtoBuf;
 using QuantConnect.Data;
 using QuantConnect.Data.UniverseSelection;
 using QuantConnect.DataSource;
@@ -249,6 +248,33 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
+        public void TheManagersNameComesFromManagersCsv()
+        {
+            var previous = Globals.DataFolder;
+            var root = Path.Combine(Path.GetTempPath(), $"sec-13f-names-{Guid.NewGuid():N}");
+            var folder = Path.Combine(root, "alternative", "sec", "13f");
+            Directory.CreateDirectory(folder);
+            File.WriteAllLines(Path.Combine(folder, "managers.csv"), ["1067983,BERKSHIRE HATHAWAY, INC"]);
+
+            try
+            {
+                Configuration.Config.Set("data-folder", root);
+                Globals.Reset();
+                SEC13FManagerNameProvider.Reset();
+
+                Assert.AreEqual("BERKSHIRE HATHAWAY, INC", Read(FullLine).ManagerName);
+                Assert.IsNull(Read(FullLine.Replace(",1067983,", ",42,")).ManagerName);
+            }
+            finally
+            {
+                Configuration.Config.Set("data-folder", previous);
+                Globals.Reset();
+                SEC13FManagerNameProvider.Reset();
+                Directory.Delete(root, true);
+            }
+        }
+
+        [Test]
         public void TheCollectionCarriesEveryPositionOfTheDay()
         {
             // Two managers reporting the same security on the same day give two records in one
@@ -350,25 +376,6 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
-        public void AProtobufRoundTripKeepsEveryField()
-        {
-            // The sub type is registered once for the whole assembly, in ProtobufSubTypes.
-            var original = Read(FullLine);
-            var bytes = ((BaseData)original).ProtobufSerialize(new Guid());
-
-            using var stream = new MemoryStream(bytes);
-            var deserialized = (SEC13FHolding)Serializer.Deserialize<IEnumerable<BaseData>>(stream).First();
-
-            Assert.AreEqual(original.AccessionNumber, deserialized.AccessionNumber);
-            Assert.AreEqual(original.ManagerCik, deserialized.ManagerCik);
-            Assert.AreEqual(original.PeriodEnd, deserialized.PeriodEnd);
-            Assert.AreEqual(original.Amount, deserialized.Amount);
-            Assert.AreEqual(original.ReportedValue, deserialized.ReportedValue);
-            Assert.AreEqual(original.ValueScale, deserialized.ValueScale);
-            Assert.AreEqual(original.MarketValue, deserialized.MarketValue);
-        }
-
-        [Test]
         public void AJsonRoundTripKeepsEveryProperty()
         {
             // Compared by reflection rather than field by field, so a property added later is
@@ -385,42 +392,13 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
-        public void TheRecordsProtobufContractIsCompleteAndUnique()
-        {
-            var members = typeof(SEC13FHolding)
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
-                .Select(property => property.GetCustomAttribute<ProtoMemberAttribute>())
-                .Where(attribute => attribute != null)
-                .Select(attribute => attribute.Tag)
-                .ToList();
-
-            Assert.IsNotNull(typeof(SEC13FHolding).GetCustomAttribute<ProtoContractAttribute>(), "ProtoContract is missing");
-            Assert.Greater(members.Count, 0, "no ProtoMember attributes found");
-            Assert.AreEqual(members.Count, members.Distinct().Count(), "duplicate ProtoMember numbers");
-        }
-
-        [Test]
-        public void EveryStoredPropertyCarriesAProtoMember()
-        {
-            // A property added later without a member number would serialize as nothing, which is
-            // indistinguishable from a real absent reading. MarketValue is exempt because it is
-            // computed, and Symbol because BaseData carries it.
-            var missing = typeof(SEC13FHolding)
-                .GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly)
-                .Where(property => property.SetMethod != null)
-                .Where(property => property.GetCustomAttribute<ProtoMemberAttribute>() == null)
-                .Select(property => property.Name)
-                .ToList();
-
-            CollectionAssert.IsEmpty(missing, "stored properties without a ProtoMember number");
-        }
-
-        [Test]
         public void EveryProcessedRowParses()
         {
             // Reads the processor's own output when it is there, which is the only case that proves
             // the writer and the reader agree on the layout.
-            var folder = Path.Combine("..", "..", "..", "..", "output", "alternative", "sec", "13f");
+            // From the test binaries rather than the working directory, which the runner chooses.
+            var folder = Path.Combine(TestContext.CurrentContext.TestDirectory,
+                "..", "..", "..", "..", "output", "alternative", "sec", "13f");
             if (!Directory.Exists(folder))
             {
                 Assert.Ignore($"No processed output at {folder}");
@@ -433,7 +411,7 @@ namespace QuantConnect.DataLibrary.Tests
             }
 
             var rows = 0;
-            foreach (var path in zips.Take(50))
+            foreach (var path in zips)
             {
                 using var zip = System.IO.Compression.ZipFile.OpenRead(path);
                 foreach (var entry in zip.Entries)
@@ -448,6 +426,7 @@ namespace QuantConnect.DataLibrary.Tests
                         // The entry is named after the filing date every line in it carries.
                         Assert.AreEqual(Path.GetFileNameWithoutExtension(entry.Name),
                             holding.Time.ToString("yyyyMMdd"), $"{path}#{entry.Name}");
+                        Assert.IsFalse(holding.OtherManager.Contains(";;"), $"{path}#{entry.Name}: {line}");
                         rows++;
                     }
                 }

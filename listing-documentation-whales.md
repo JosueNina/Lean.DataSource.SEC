@@ -93,8 +93,8 @@ public override void OnData(Slice slice)
 
 A point's `Time` is the filing date and its `EndTime` is midnight that night. LEAN emits a point at
 its end time, so a day's filings reach your algorithm at 00:00 the following day, after EDGAR has
-finished listing that day at about 22:05 ET. History and live carry the same stamp, so a backtest
-never reads a filing before it existed.
+finished listing that day at about 22:05 ET, so a backtest never reads a filing before it existed.
+A filing whose EDGAR index came days late is added to history under its filing date.
 
 The filing date is not the quarter the position describes, and the gap between them cannot be
 derived: measured across 11,761 filings in one window it runs minimum 0 days, p10 16, median 42, p90
@@ -218,8 +218,8 @@ off it will not work, because it has none.
 
 With `flatten=True` you get a DataFrame with **one row per reported position**, indexed by time and
 symbol, whose columns are the record's fields in lower case: `accessionnumber`, `managercik`,
-`periodend`, `formtype`, `amendmenttype`, `amendmentnumber`, `titleofclass`, `amount`, `amounttype`,
-`reportedvalue`, `valuescale`, `marketvalue`, `putcall`, `investmentdiscretion`, `othermanager`,
+`managername`, `periodend`, `formtype`, `amendmenttype`, `amendmentnumber`, `titleofclass`,
+`amount`, `amounttype`, `reportedvalue`, `valuescale`, `marketvalue`, `putcall`, `investmentdiscretion`, `othermanager`,
 `votingsole`, `votingshared`, `votingnone`, `confidentialomitted`, `datereported`. This is the form
 to use for anything cross-sectional. Sixty days of AAPL history is one Series of 39 entries or a
 DataFrame of 6,333 rows, which is the difference the flag makes.

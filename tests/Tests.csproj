@@ -13,12 +13,6 @@
     <Content Include="..\SECReportDataAlgorithm.py" Link="SECReportDataAlgorithm.py" />
     <Compile Include="..\SEC13FAlgorithm.cs" Link="SEC13FAlgorithm.cs" />
     <Content Include="..\SEC13FAlgorithm.py" Link="SEC13FAlgorithm.py" />
-    <Content Include="TestData\sc13d_0001193125-26-389440.txt">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
-    <Content Include="TestData\sc13g_0001213900-26-099322.txt">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </Content>
     <Content Include="TestData\sec_report_raw_single.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>

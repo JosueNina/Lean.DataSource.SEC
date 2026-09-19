@@ -225,6 +225,79 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
+        public void OnlyAShareLineIsHeldAgainstTheClose()
+        {
+            // A bond at par against a stock near $1,000 sits on the thousands step by chance, and so
+            // can an option line. Neither has a price of its own, so both keep their filing's unit.
+            SeedCloses("20231229", ("aapl", 1000m));
+            var filing = new DateTime(2024, 2, 14);
+            var quarter = new DateTime(2023, 12, 31);
+            var lines = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000001", "037833100", "100000", "100", "SH"),
+                    Line("0000000000-00-000001", "037833100", "100", "100", "PRN"),
+                    Line("0000000000-00-000001", "037833100", "100", "100", "SH", putCall: "Call")
+                },
+                resolve: true,
+                Submission("0000000000-00-000001", filing, quarter, cik: 111)).Values.Single().Lines;
+
+            Assert.AreEqual(new[] { 0, 0, 0 }, lines.Select(line => line.ValueScale).ToArray());
+        }
+
+        [Test]
+        public void AFieldTheFilingLeftEmptyIsNotAZero()
+        {
+            var line = ReadInfoTable(
+                new[]
+                {
+                    Line("0000000000-00-000001", "037833100", "", "100", "SH", votingSole: "", votingShared: "0", votingNone: "")
+                },
+                Submission("0000000000-00-000001", Filed, new DateTime(2023, 12, 31))).Values.Single().Lines.Single();
+
+            Assert.IsNull(line.ReportedValue);
+            Assert.IsNull(line.VotingSole);
+            Assert.IsNull(line.VotingNone);
+            Assert.AreEqual(0m, line.VotingShared);
+            Assert.AreEqual(100m, line.Amount);
+        }
+
+        [TestCase("1, 2", "1;2")]
+        [TestCase("9,10,11", "9;10;11")]
+        [TestCase("1 2", "1;2")]
+        [TestCase("1;2", "1;2")]
+        [TestCase("NONE", "")]
+        [TestCase("0", "")]
+        [TestCase("", "")]
+        public void TheOtherManagersAreJoinedBySingleSemicolons(string filed, string expected)
+        {
+            // A comma became a space and every space a semicolon, so "9, 10" was published as "9;;10".
+            Assert.AreEqual(expected, SEC13FDownloader.FormatOtherManagers(filed));
+        }
+
+        [TestCase("G1151C101", true)]
+        [TestCase("N07059210", true)]
+        [TestCase("037833100", false)]
+        [TestCase("", false)]
+        public void ACinsOpensWithALetter(string cusip, bool expected)
+        {
+            Assert.AreEqual(expected, SEC13FDownloader.IsCins(cusip));
+        }
+
+        [TestCase("03783#100")]
+        [TestCase("0378-3100")]
+        [TestCase("N/A")]
+        public void ACusipNoIsinCanHoldResolvesToNothing(string cusip)
+        {
+            // Building the ISIN threw on the first such character and ended the run.
+            SeedMapFiles("aapl");
+            using var downloader = Downloader();
+            downloader.TickerCrosswalk = new Dictionary<string, SEC13FTickerCrosswalk.Entry>();
+
+            Assert.IsNull(downloader.ResolveSecurity(cusip, Filed));
+        }
+
+        [Test]
         public void TheUnitIsDecidedWithoutLookingAtAnyOtherFiling()
         {
             // The unit used to come from the median of every filing in the three month window, so a
@@ -504,7 +577,7 @@ namespace QuantConnect.DataLibrary.Tests
             // would add a second time, so it stops instead of guessing.
             var shelf = PublishedShelf();
             File.Delete(Path.Combine(shelf, "edgar-days.txt"));
-            File.WriteAllLines(Path.Combine(shelf, "aapl.csv"), new[] { "20240215" });
+            SeedPublishedZip(shelf, "aapl", "20240215");
 
             using var downloader = new SEC13FDownloader(
                 Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 9));
@@ -523,14 +596,14 @@ namespace QuantConnect.DataLibrary.Tests
                 Environment.SetEnvironmentVariable("QC_DATAFLEET_DEPLOYMENT_DATE", null);
 
                 Config.Set(Program.RebuildHistoryKey, "false");
-                Assert.IsFalse(Program.TryParseDeploymentDate(Program.RebuildHistoryKey, out _), "no date and no rebuild asked for");
+                Assert.IsFalse(SECProcessingContext.TryParseDeploymentDate(Program.RebuildHistoryKey, out _), "no date and no rebuild asked for");
 
                 Config.Set(Program.RebuildHistoryKey, "true");
-                Assert.IsTrue(Program.TryParseDeploymentDate(Program.RebuildHistoryKey, out var rebuild));
+                Assert.IsTrue(SECProcessingContext.TryParseDeploymentDate(Program.RebuildHistoryKey, out var rebuild));
                 Assert.IsNull(rebuild, "the rebuild runs over the whole history");
 
                 Environment.SetEnvironmentVariable("QC_DATAFLEET_DEPLOYMENT_DATE", "20260908");
-                Assert.IsTrue(Program.TryParseDeploymentDate(Program.RebuildHistoryKey, out var date));
+                Assert.IsTrue(SECProcessingContext.TryParseDeploymentDate(Program.RebuildHistoryKey, out var date));
                 Assert.AreEqual(new DateTime(2026, 9, 8), date);
             }
             finally
@@ -547,7 +620,7 @@ namespace QuantConnect.DataLibrary.Tests
             // the guard is exercised here, by handing it a deployment date and a shelf and checking
             // it does not stop the run before the first archive is fetched.
             var processed = PublishedShelf();
-            File.WriteAllLines(Path.Combine(processed, "aapl.csv"), new[] { "20240215" });
+            SeedPublishedZip(processed, "aapl", "20240215");
 
             using var downloader = new SEC13FDownloader(
                 Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 8));
@@ -1041,37 +1114,115 @@ namespace QuantConnect.DataLibrary.Tests
             Assert.AreEqual(new DateTime(2026, 6, 30), filing.Period);
             Assert.IsTrue(filing.ConfidentialOmitted);
             Assert.AreEqual(2, filing.Lines.Count);
-            Assert.AreEqual(new[] { "88025U109", "274974", "7172", "SH", null, "7172", "0" }, filing.Lines[0]);
-            Assert.AreEqual("Put", filing.Lines[1][4]);
+            Assert.AreEqual(new[] { "88025U109", null, "274974", "7172", "SH", null, null, null, "7172", "0", "0" }, filing.Lines[0]);
+            Assert.AreEqual(new[] { "037833100", "COM", "1000", "50", "SH", "Put", "DFND", "1, 2", "0", "50", null }, filing.Lines[1]);
+
+            // The filing manager's name, not the signer's.
+            Assert.AreEqual("WEALTH ADVISORS, INC.", filing.ManagerName);
+            Assert.AreEqual("RESTATEMENT", filing.AmendmentType);
+            Assert.AreEqual("1", filing.AmendmentNumber);
+            Assert.AreEqual(new DateTime(2026, 5, 15), filing.DateReported);
         }
 
         [Test]
-        public void ADaysArchiveCarriesTheTablesTheProcessorReads()
+        public void ADaysArchiveIsReadByTheProcessorLikeADataSet()
         {
-            // The day is written in the data sets' own layout so the rest of the processor reads it
-            // like a window, which is what makes EDGAR and the data sets give the same rows.
-            var filing = SEC13FEdgarDay.ParseFiling(SampleEntry(), SampleSubmission());
+            // Pushed through the processor rather than read back table by table: the day's archive
+            // once lacked the cover page and four columns the processor had come to require, and a
+            // test listing the columns itself stayed green while every EDGAR day threw.
+            SeedMapFiles("aapl");
+            var day = new DateTime(2026, 8, 14);
+            using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                null, Path.Combine(_root, "raw"));
+            downloader.TickerCrosswalk = UnitTestCrosswalk();
 
-            using var buffer = new MemoryStream();
-            SEC13FEdgarDay.WriteArchive(buffer, new[] { filing });
-            buffer.Position = 0;
-            using var zip = new ZipArchive(buffer, ZipArchiveMode.Read);
+            ProcessEdgarDay(downloader, day);
+            downloader.FinalizeSecurityFiles();
 
-            var submission = SEC13FFiles.ReadTable(zip, "edgar", "SUBMISSION.tsv", false,
-                "ACCESSION_NUMBER", "FILING_DATE", "SUBMISSIONTYPE", "CIK", "PERIODOFREPORT").Single();
-            Assert.AreEqual("2026-08-14", submission.Fields[submission.Columns["FILING_DATE"]]);
-            Assert.AreEqual("2026-06-30", submission.Fields[submission.Columns["PERIODOFREPORT"]]);
+            var row = EntryLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "aapl.zip"), "20260814.csv").Single();
+            Assert.AreEqual("20260814,0001214659-26-010148,107136,20260630,13F-HR,RESTATEMENT,1,COM,50,SH,1000,0,P,DFND,1;2,0,50,,1,20260515", row);
 
-            var summary = SEC13FFiles.ReadTable(zip, "edgar", "SUMMARYPAGE.tsv", false,
-                "ACCESSION_NUMBER", "ISCONFIDENTIALOMITTED").Single();
-            Assert.AreEqual("Y", summary.Fields[summary.Columns["ISCONFIDENTIALOMITTED"]]);
+            Assert.AreEqual(new[] { "107136,WEALTH ADVISORS, INC." },
+                File.ReadAllLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv")));
+        }
 
-            var lines = SEC13FFiles.ReadTable(zip, "edgar", "INFOTABLE.tsv", false,
-                "ACCESSION_NUMBER", "CUSIP", "VALUE", "SSHPRNAMT", "SSHPRNAMTTYPE", "PUTCALL",
-                "VOTING_AUTH_SOLE", "VOTING_AUTH_SHARED").ToList();
-            Assert.AreEqual(2, lines.Count);
-            Assert.AreEqual("037833100", lines[1].Fields[lines[1].Columns["CUSIP"]]);
-            Assert.AreEqual("Put", lines[1].Fields[lines[1].Columns["PUTCALL"]]);
+        [Test]
+        public void AnOptionCusipGivesALineTheSideItLeftEmpty()
+        {
+            // The option's CUSIP reaches the underlying's file, where a line without PUTCALL would
+            // read as that many shares of the stock. Issue 90 is a call and 95 a put.
+            var apple = SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), "AAPL", Market.USA);
+            SeedMapFileRows(("aapl", new[] { "19801212,aapl", "20501231,aapl" }));
+            SeedSecurityDatabase($"{apple},03783310,BBG000B9XRY4,2046251,US0378331005,320193");
+
+            var day = new DateTime(2026, 8, 14);
+            var filing = OptionFiling(day);
+            filing.Lines.Add(["037833900", "COM", "1000", "50", "SH", null, "SOLE", null, "50", "0", "0"]);
+            filing.Lines.Add(["037833956", "COM", "1000", "50", "SH", null, "SOLE", null, "50", "0", "0"]);
+            filing.Lines.Add(["037833956", "COM", "1000", "50", "SH", "Call", "SOLE", null, "50", "0", "0"]);
+
+            var rows = PublishedRows(day, filing, "aapl");
+
+            Assert.AreEqual(new[] { "C", "P", "C" }, rows.Select(row => row.Split(',')[12]).ToArray(),
+                "a side the line states is kept");
+        }
+
+        [Test]
+        public void AnOptionOnAFundFamilyIsResolvedByThePriceOfItsLine()
+        {
+            // Every fund of a family shares one option CUSIP, so the issuer does not say which fund a
+            // line is written on. The line reports the underlying's value and shares, and so its price.
+            var iwm = SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), "IWM", Market.USA);
+            var eem = SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), "EEM", Market.USA);
+            SeedMapFiles("iwm", "eem");
+            SeedSecurityDatabase(
+                $"{iwm},46428765,BBG000CGC9C4,2622059,US4642876555,1100663",
+                $"{eem},46428723,BBG000M0P5L2,2801669,US4642872349,1100663");
+            SeedCoarse("20260630", (iwm, 220m), (eem, 45m));
+
+            var day = new DateTime(2026, 8, 14);
+            var filing = OptionFiling(day);
+            filing.Lines.Add(["464287905", "RUSSELL 2000 ETF", "22000", "100", "SH", "Call", "SOLE", null, "0", "0", "100"]);
+            filing.Lines.Add(["464287905", "MSCI EMERG MKT", "4500", "100", "SH", null, "SOLE", null, "0", "0", "100"]);
+            filing.Lines.Add(["464287905", "SOMETHING ELSE", "9900", "100", "SH", "Call", "SOLE", null, "0", "0", "100"]);
+
+            Assert.AreEqual(1, PublishedRows(day, filing, "iwm").Count);
+            var emerging = PublishedRows(day, null, "eem").Single().Split(',');
+            Assert.AreEqual("MSCI EMERG MKT", emerging[7]);
+            Assert.AreEqual("C", emerging[12], "the side comes from the CUSIP");
+        }
+
+        [TestCase(220, 220, true)]
+        [TestCase(221, 220, true)]
+        [TestCase(224, 220, false)]
+        [TestCase(0.221, 220, true)]
+        [TestCase(200, 220, false)]
+        [TestCase(45, 220, false)]
+        public void AnOptionLineNamesAFundOnlyWithinHalfAPercentOfItsClose(double price, double close, bool expected)
+        {
+            Assert.AreEqual(expected, SEC13FDownloader.MatchesClose((decimal)price, (decimal)close));
+        }
+
+        [Test]
+        public void AnIncrementalRunKeepsThePublishedDatesOfASecurity()
+        {
+            // The destination starts empty and replaces what is published, so a run that wrote only
+            // its own dates would cut the security's history down to them.
+            SeedMapFiles("aapl");
+            SeedPublishedZip(PublishedShelf(), "aapl", "20240215");
+
+            var day = new DateTime(2026, 8, 14);
+            using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                day, Path.Combine(_root, "raw"));
+            downloader.TickerCrosswalk = UnitTestCrosswalk();
+
+            ProcessEdgarDay(downloader, day);
+            downloader.FinalizeSecurityFiles();
+
+            var destination = Path.Combine(_root, "out", SEC13FHolding.ReportFolder);
+            using var zip = ZipFile.OpenRead(Path.Combine(destination, "aapl.zip"));
+            Assert.AreEqual(new[] { "20240215.csv", "20260814.csv" }, zip.Entries.Select(entry => entry.Name).OrderBy(name => name).ToArray());
+            Assert.IsFalse(File.Exists(Path.Combine(destination, "aapl.csv")), "the date index is gone");
         }
 
         [Test]
@@ -1145,8 +1296,11 @@ namespace QuantConnect.DataLibrary.Tests
                 "<XML>",
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
                 "<edgarSubmission xmlns=\"http://www.sec.gov/edgar/thirteenffiler\"><headerData>" +
-                "<submissionType>13F-HR</submissionType><filerInfo><periodOfReport>06-30-2026</periodOfReport>" +
-                "</filerInfo></headerData><formData><summaryPage><isConfidentialOmitted>true</isConfidentialOmitted>" +
+                "<submissionType>13F-HR/A</submissionType><filerInfo><periodOfReport>06-30-2026</periodOfReport>" +
+                "</filerInfo></headerData><formData><coverPage><isAmendment>true</isAmendment><amendmentNo>1</amendmentNo>" +
+                "<amendmentInfo><amendmentType>RESTATEMENT</amendmentType><dateReported>05-15-2026</dateReported></amendmentInfo>" +
+                "<filingManager><name>WEALTH ADVISORS, INC.</name></filingManager></coverPage>" +
+                "<signatureBlock><name>Someone Else</name></signatureBlock><summaryPage><isConfidentialOmitted>true</isConfidentialOmitted>" +
                 "</summaryPage></formData></edgarSubmission>",
                 "</XML>",
                 "</TEXT>",
@@ -1160,10 +1314,11 @@ namespace QuantConnect.DataLibrary.Tests
                 "<ns1:sshPrnamt>7172</ns1:sshPrnamt><ns1:sshPrnamtType>SH</ns1:sshPrnamtType></ns1:shrsOrPrnAmt>" +
                 "<ns1:votingAuthority><ns1:Sole>7172</ns1:Sole><ns1:Shared>0</ns1:Shared><ns1:None>0</ns1:None>" +
                 "</ns1:votingAuthority></ns1:infoTable>" +
-                "<ns1:infoTable><ns1:cusip>037833100</ns1:cusip><ns1:value>1000</ns1:value><ns1:shrsOrPrnAmt>" +
+                "<ns1:infoTable><ns1:titleOfClass>COM</ns1:titleOfClass><ns1:cusip>037833100</ns1:cusip><ns1:value>1000</ns1:value><ns1:shrsOrPrnAmt>" +
                 "<ns1:sshPrnamt>50</ns1:sshPrnamt><ns1:sshPrnamtType>SH</ns1:sshPrnamtType></ns1:shrsOrPrnAmt>" +
-                "<ns1:putCall>Put</ns1:putCall><ns1:votingAuthority><ns1:Sole>0</ns1:Sole><ns1:Shared>50</ns1:Shared>" +
-                "<ns1:None>0</ns1:None></ns1:votingAuthority></ns1:infoTable></ns1:informationTable>",
+                "<ns1:putCall>Put</ns1:putCall><ns1:investmentDiscretion>DFND</ns1:investmentDiscretion>" +
+                "<ns1:otherManager>1, 2</ns1:otherManager><ns1:votingAuthority><ns1:Sole>0</ns1:Sole><ns1:Shared>50</ns1:Shared>" +
+                "</ns1:votingAuthority></ns1:infoTable></ns1:informationTable>",
                 "</XML>",
                 "</TEXT>",
                 "</DOCUMENT>",
@@ -1185,15 +1340,14 @@ namespace QuantConnect.DataLibrary.Tests
 
         /// <summary>One SUBMISSION row, keyed by its accession number the way the processor keys it.</summary>
         private static KeyValuePair<string, SEC13FDownloader.Submission> Submission(string accession,
-            DateTime filingDate, DateTime period, int cik = 1, bool isAmendment = false)
+            DateTime filingDate, DateTime period, int cik = 1)
         {
             return new KeyValuePair<string, SEC13FDownloader.Submission>(accession,
                 new SEC13FDownloader.Submission
                 {
                     Cik = cik,
                     FilingDate = filingDate,
-                    Period = period,
-                    IsAmendment = isAmendment
+                    Period = period
                 });
         }
 
@@ -1282,19 +1436,71 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
 
-        /// <summary>
-        /// The quarters one universe line carries: the identifier and the ticker, then how many
-        /// quarters follow and that many groups, each of them starting with its reported quarter.
-        /// The group width is read from the line rather than assumed, the way the data type reads it.
-        /// </summary>
-        private static IEnumerable<string> QuartersOf(string line)
+        private static SEC13FEdgarDay.Filing OptionFiling(DateTime day)
         {
-            const int identifierColumns = 3;
-            var csv = line.Split(',');
-            var quarters = int.Parse(csv[2], System.Globalization.CultureInfo.InvariantCulture);
-            var width = (csv.Length - identifierColumns) / quarters;
+            return new SEC13FEdgarDay.Filing
+            {
+                Accession = "0000000000-26-000001", SubmissionType = "13F-HR", Cik = 1, Filed = day,
+                Period = new DateTime(2026, 6, 30), ManagerName = "A MANAGER"
+            };
+        }
 
-            return Enumerable.Range(0, quarters).Select(quarter => csv[identifierColumns + quarter * width]);
+        /// <summary>Runs a filing through the processor, when given one, and reads a ticker's rows of the day.</summary>
+        private List<string> PublishedRows(DateTime day, SEC13FEdgarDay.Filing filing, string ticker)
+        {
+            if (filing != null)
+            {
+                using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                    null, Path.Combine(_root, "raw"));
+                downloader.TickerCrosswalk = new Dictionary<string, SEC13FTickerCrosswalk.Entry>();
+
+                ProcessEdgarDay(downloader, day, filing);
+                downloader.FinalizeSecurityFiles();
+            }
+
+            return EntryLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, $"{ticker}.zip"), $"{day:yyyyMMdd}.csv");
+        }
+
+        /// <summary>One trading day's coarse file with these closes, keyed by security.</summary>
+        private void SeedCoarse(string day, params (SecurityIdentifier Security, decimal Close)[] closes)
+        {
+            var coarse = Path.Combine(_root, "data", "equity", "usa", "fundamental", "coarse");
+            Directory.CreateDirectory(coarse);
+            File.WriteAllLines(Path.Combine(coarse, $"{day}.csv"), closes.Select(pair =>
+                $"{pair.Security},{pair.Security.Symbol},{pair.Close.ToString(System.Globalization.CultureInfo.InvariantCulture)},100,1000,True,1,1"));
+        }
+
+        /// <summary>Writes the sample filing as the EDGAR archive of a day and folds it in, as a run does.</summary>
+        private void ProcessEdgarDay(SEC13FDownloader downloader, DateTime day, SEC13FEdgarDay.Filing filing = null)
+        {
+            var cache = Path.Combine(_root, "raw", SEC13FHolding.ReportFolder, "archives");
+            Directory.CreateDirectory(cache);
+            using (var stream = File.Create(Path.Combine(cache, SEC13FEdgarDay.ArchiveName(day))))
+            {
+                SEC13FEdgarDay.WriteArchive(stream, [filing ?? SEC13FEdgarDay.ParseFiling(SampleEntry(), SampleSubmission())]);
+            }
+
+            downloader.ProcessArchive(new SEC13FDownloader.Archive(
+                SEC13FEdgarDay.ArchiveName(day), "https://localhost/day", day, day, IsDaily: true));
+            downloader.FlushPendingRows();
+        }
+
+        /// <summary>A published security zip holding one entry per date given.</summary>
+        private static void SeedPublishedZip(string shelf, string ticker, params string[] dates)
+        {
+            using var zip = ZipFile.Open(Path.Combine(shelf, $"{ticker}.zip"), ZipArchiveMode.Create);
+            foreach (var date in dates)
+            {
+                using var writer = new StreamWriter(zip.CreateEntry($"{date}.csv").Open());
+                writer.Write($"{date},0000000000-24-000001,1,20231231,13F-HR,,,COM,1,SH,1,0,,SOLE,,1,0,0,0,\n");
+            }
+        }
+
+        private static List<string> EntryLines(string zipPath, string entry)
+        {
+            using var zip = ZipFile.OpenRead(zipPath);
+            using var reader = new StreamReader(zip.GetEntry(entry).Open());
+            return reader.ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries).ToList();
         }
 
         /// <summary>

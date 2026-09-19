@@ -18,7 +18,6 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using NodaTime;
-using ProtoBuf;
 using QuantConnect.Data;
 using QuantConnect.Util;
 using static QuantConnect.StringExtensions;
@@ -45,7 +44,6 @@ namespace QuantConnect.DataSource
     /// SEC13FHoldings, the collection of every record a security carries for one
     /// filing date.
     /// </summary>
-    [ProtoContract(SkipConstructor = true)]
     public class SEC13FHolding : BaseData
     {
         // The frozen layout: the filing date, the filing's identity, the reported quarter, the
@@ -60,16 +58,20 @@ namespace QuantConnect.DataSource
         /// 0001067983-26-000012. It identifies the filing on the SEC's own site and is what groups
         /// the records of one submission back together.
         /// </summary>
-        [ProtoMember(1)]
         public string AccessionNumber { get; set; }
 
         /// <summary>
         /// Central Index Key of the manager that filed the submission. It is the stable identity of
         /// a fund across name changes, which is why it, and not the name, is carried on every
-        /// record. The names live once in managers.csv beside the dataset.
+        /// line of the files. The names live once in managers.csv beside the dataset.
         /// </summary>
-        [ProtoMember(2)]
         public int ManagerCik { get; set; }
+
+        /// <summary>
+        /// Name of the manager as its most recent cover page states it, read from managers.csv.
+        /// It is the current name even on an old filing, and null for a CIK the file does not carry.
+        /// </summary>
+        public string ManagerName { get; set; }
 
         /// <summary>
         /// The quarter the position is reported for, which is the SEC PERIODOFREPORT. It is carried
@@ -77,14 +79,12 @@ namespace QuantConnect.DataSource
         /// filings and amendments mean one filing date carries several different reported quarters,
         /// and the gap between them runs from zero to years.
         /// </summary>
-        [ProtoMember(3)]
         public DateTime PeriodEnd { get; set; }
 
         /// <summary>
         /// Submission type, which is 13F-HR for a holdings report and 13F-HR/A for an amendment.
         /// A 13F-NT notice reports no positions and so contributes no records at all.
         /// </summary>
-        [ProtoMember(4)]
         public string FormType { get; set; }
 
         /// <summary>
@@ -92,18 +92,15 @@ namespace QuantConnect.DataSource
         /// distinction decides whether the amendment replaces the original filing or supplements
         /// it, and the SEC leaves it to the filer to declare. Empty on an original filing.
         /// </summary>
-        [ProtoMember(5)]
         public string AmendmentType { get; set; }
 
         /// <summary>Sequence number of the amendment, or null on an original filing.</summary>
-        [ProtoMember(6)]
         public int? AmendmentNumber { get; set; }
 
         /// <summary>
         /// Class of the security as the manager titled it, such as COM or CL A. It is free text
         /// that the filer writes, so it varies between managers for the same security.
         /// </summary>
-        [ProtoMember(7)]
         public string TitleOfClass { get; set; }
 
         /// <summary>
@@ -111,11 +108,9 @@ namespace QuantConnect.DataSource
         /// and a principal amount when it is PRN. The two are not comparable and are deliberately
         /// left in one field with its unit beside it, as the SEC reports them.
         /// </summary>
-        [ProtoMember(8)]
         public decimal? Amount { get; set; }
 
         /// <summary>Unit of Amount: SH for shares, PRN for a principal amount.</summary>
-        [ProtoMember(9)]
         public string AmountType { get; set; }
 
         /// <summary>
@@ -124,7 +119,6 @@ namespace QuantConnect.DataSource
         /// dollars, and filers on both sides of that change ignore the instruction, so the number
         /// is published untouched with ValueScale beside it.
         /// </summary>
-        [ProtoMember(10)]
         public decimal? ReportedValue { get; set; }
 
         /// <summary>
@@ -139,7 +133,6 @@ namespace QuantConnect.DataSource
         /// manager filed stays readable and this judgement stays separable from it. Use
         /// MarketValue to apply it.
         /// </summary>
-        [ProtoMember(11)]
         public int ValueScale { get; set; }
 
         /// <summary>
@@ -165,33 +158,27 @@ namespace QuantConnect.DataSource
         /// on which side. Null for a holding of the security. An option line states the shares
         /// underlying the contracts, not the number of contracts.
         /// </summary>
-        [ProtoMember(12)]
         public OptionRight? PutCall { get; set; }
 
         /// <summary>
         /// Who exercises investment discretion over the position: SOLE for the filing manager
         /// alone, DFND when it is defined by other managers, OTR otherwise.
         /// </summary>
-        [ProtoMember(13)]
         public string InvestmentDiscretion { get; set; }
 
         /// <summary>
         /// The other managers that share the position, as the sequence numbers the filing gives
         /// them on its cover page, separated by semicolons. Empty when the manager reports alone.
         /// </summary>
-        [ProtoMember(14)]
         public string OtherManager { get; set; }
 
         /// <summary>Shares over which the manager holds sole voting authority.</summary>
-        [ProtoMember(15)]
         public decimal? VotingSole { get; set; }
 
         /// <summary>Shares over which the manager shares voting authority.</summary>
-        [ProtoMember(16)]
         public decimal? VotingShared { get; set; }
 
         /// <summary>Shares over which the manager holds no voting authority.</summary>
-        [ProtoMember(17)]
         public decimal? VotingNone { get; set; }
 
         /// <summary>
@@ -199,7 +186,6 @@ namespace QuantConnect.DataSource
         /// confidential treatment. The filing is then incomplete by design and the withheld
         /// positions surface in a later one, so the flag is carried rather than silently ignored.
         /// </summary>
-        [ProtoMember(18)]
         public bool ConfidentialOmitted { get; set; }
 
         /// <summary>
@@ -208,7 +194,6 @@ namespace QuantConnect.DataSource
         /// rest, so it marks positions that were withheld and later released rather than serving as
         /// a timestamp. The timestamp is Time, the filing date.
         /// </summary>
-        [ProtoMember(19)]
         public DateTime? DateReported { get; set; }
 
         /// <summary>
@@ -265,6 +250,7 @@ namespace QuantConnect.DataSource
 
             var point = Parse(csv);
             point.Symbol = config.Symbol;
+            point.ManagerName = SEC13FManagerNameProvider.GetName(point.ManagerCik);
             return point;
         }
 
@@ -355,6 +341,7 @@ namespace QuantConnect.DataSource
                 Value = Value,
                 AccessionNumber = AccessionNumber,
                 ManagerCik = ManagerCik,
+                ManagerName = ManagerName,
                 PeriodEnd = PeriodEnd,
                 FormType = FormType,
                 AmendmentType = AmendmentType,
@@ -378,7 +365,7 @@ namespace QuantConnect.DataSource
         /// <summary>String representation for debugging.</summary>
         public override string ToString()
         {
-            return Invariant($"{Symbol} - CIK {ManagerCik} for {PeriodEnd:yyyy-MM-dd}: {Amount} {AmountType}, {MarketValue:C0}");
+            return Invariant($"{Symbol} - {ManagerName ?? $"CIK {ManagerCik}"} for {PeriodEnd:yyyy-MM-dd}: {Amount} {AmountType}, {MarketValue:C0}");
         }
     }
 }

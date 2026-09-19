@@ -14,13 +14,10 @@
 */
 
 using QuantConnect.Configuration;
-using QuantConnect.DataSource;
 using QuantConnect.Logging;
 using QuantConnect.Util;
 using System;
 using System.Diagnostics;
-using System.Globalization;
-using System.IO;
 
 namespace QuantConnect.DataProcessing
 {
@@ -32,8 +29,8 @@ namespace QuantConnect.DataProcessing
     ///
     ///  - "reports" (the default): the 10-K, 10-Q and 8-K filings, downloaded with
     ///    <see cref="SECDataDownloader"/> and converted with <see cref="SECDataConverter"/>.
-    ///  - "13f" (<see cref="SEC13FDownloader"/>): Form 13F institutional holdings, aggregated per
-    ///    security from the quarterly structured data sets.
+    ///  - "13f" (<see cref="SEC13FDownloader"/>): Form 13F institutional holdings, every position
+    ///    as its manager filed it, from the SEC's structured data sets and EDGAR's daily indexes.
     ///
     /// The default keeps a job that sets no dataset-name doing exactly what it did before the key
     /// existed.
@@ -67,7 +64,6 @@ namespace QuantConnect.DataProcessing
                 case SEC13FDownloader.DatasetName:
                     return Process13F();
 
-
                 default:
                     Log.Error($"DataProcessing.Main(): Unknown dataset-name '{dataset}'. Valid options: " +
                               $"{ReportsDatasetName}, {SEC13FDownloader.DatasetName}");
@@ -81,11 +77,15 @@ namespace QuantConnect.DataProcessing
         /// <returns>Zero on success, one on any failure</returns>
         private static int ProcessReports()
         {
-            var processingDateValue = Environment.GetEnvironmentVariable("QC_DATAFLEET_DEPLOYMENT_DATE");
-            var processingDate = DateTime.ParseExact(processingDateValue, "yyyyMMdd", CultureInfo.InvariantCulture);
-            var temporaryFolder = Config.Get("temp-output-directory", "/temp-output-directory");
-            var rawDataDirectory = Config.Get("raw-data-folder", "/raw");
-            var secDataDirectory = Path.Combine(rawDataDirectory, "alternative", "sec");
+            // The reports dataset has no full rebuild, so it always needs a date.
+            if (!SECProcessingContext.TryCreate(null, out var context))
+            {
+                return 1;
+            }
+
+            var processingDate = context.DeploymentDate.Value;
+            var temporaryFolder = context.OutputRoot;
+            var secDataDirectory = context.RawDirectory;
             Log.Trace($"DataProcessing.Main(): Processing {processingDate:yyyy-MM-dd}");
 
             var timer = Stopwatch.StartNew();
@@ -127,41 +127,20 @@ namespace QuantConnect.DataProcessing
         /// <returns>Zero on success, one on any failure</returns>
         private static int Process13F()
         {
-            // Output root: {temp-output-directory}/alternative/sec. The downloader writes its report
-            // under the folder its data class names.
-            var destinationDirectory = Path.Combine(
-                Config.Get("temp-output-directory", "/temp-output-directory"),
-                "alternative",
-                SEC13FDownloader.VendorName);
-
-            // The published history an incremental run merges its rows into. The destination is
-            // handed to the job empty, so reading history back from there would find nothing.
-            var processedDataDirectory = Path.Combine(
-                Config.Get("processed-data-directory", Globals.DataFolder),
-                "alternative",
-                SEC13FDownloader.VendorName);
-
-            // Where downloads land. The job archives this folder after every run, as it does the
-            // reports dataset's feed archives, but does not restore it before the next.
-            var rawDataDirectory = Path.Combine(
-                Config.Get("raw-data-folder", "/raw"),
-                "alternative",
-                SEC13FDownloader.VendorName);
-
-            if (!TryParseDeploymentDate(RebuildHistoryKey, out var deploymentDate))
+            if (!SECProcessingContext.TryCreate(RebuildHistoryKey, out var context))
             {
                 return 1;
             }
 
-            Log.Trace($"DataProcessing.Process13F(): writing {SEC13FDownloader.DatasetName} to {destinationDirectory}"
-                      + (deploymentDate == null ? " for the full history" : $" for {deploymentDate:yyyy-MM-dd}"));
+            Log.Trace($"DataProcessing.Process13F(): writing {SEC13FDownloader.DatasetName} to {context.OutputDirectory}"
+                      + (context.DeploymentDate == null ? " for the full history" : $" for {context.DeploymentDate:yyyy-MM-dd}"));
 
             var timer = Stopwatch.StartNew();
             SEC13FDownloader downloader;
             try
             {
-                downloader = new SEC13FDownloader(destinationDirectory, processedDataDirectory, deploymentDate,
-                    rawDataDirectory);
+                downloader = new SEC13FDownloader(context.OutputDirectory, context.ProcessedDirectory,
+                    context.DeploymentDate, context.RawDirectory);
             }
             catch (Exception err)
             {
@@ -188,43 +167,5 @@ namespace QuantConnect.DataProcessing
             }
         }
 
-
-        /// <summary>
-        /// Reads the deployment date the job runs for. A missing date is a misconfigured job rather
-        /// than a request for the whole history, which is asked for by name with
-        /// the dataset's rebuild key.
-        /// </summary>
-        /// <param name="rebuildHistoryKey">The config key that asks this dataset for a full rebuild</param>
-        /// <param name="deploymentDate">The date, or null when the run rebuilds the whole history</param>
-        /// <returns>True when the date is well formed, or absent with the rebuild asked for</returns>
-        internal static bool TryParseDeploymentDate(string rebuildHistoryKey, out DateTime? deploymentDate)
-        {
-            deploymentDate = null;
-
-            var raw = Environment.GetEnvironmentVariable("QC_DATAFLEET_DEPLOYMENT_DATE");
-            if (string.IsNullOrWhiteSpace(raw))
-            {
-                if (Config.GetBool(rebuildHistoryKey))
-                {
-                    return true;
-                }
-
-                Log.Error("DataProcessing.TryParseDeploymentDate(): QC_DATAFLEET_DEPLOYMENT_DATE is not set. Set it, or " +
-                          $"set \"{rebuildHistoryKey}\": true to rebuild the whole history");
-                return false;
-            }
-
-            // A malformed date must not quietly become a full history run: that would turn a daily
-            // job into a complete refetch of five gigabytes without anyone noticing.
-            if (!DateTime.TryParseExact(raw.Trim(), "yyyyMMdd", CultureInfo.InvariantCulture,
-                    DateTimeStyles.None, out var parsed))
-            {
-                Log.Error($"DataProcessing.TryParseDeploymentDate(): QC_DATAFLEET_DEPLOYMENT_DATE '{raw}' is not yyyyMMdd");
-                return false;
-            }
-
-            deploymentDate = parsed;
-            return true;
-        }
     }
 }

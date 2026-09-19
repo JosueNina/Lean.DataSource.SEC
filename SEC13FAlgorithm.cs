@@ -13,66 +13,59 @@
  * limitations under the License.
 */
 
+using System;
 using System.Linq;
 using System.Collections.Generic;
 using QuantConnect.Data;
 using QuantConnect.Orders;
 using QuantConnect.Algorithm;
+using QuantConnect.Algorithm.Framework.Portfolio;
 using QuantConnect.DataSource;
 
 namespace QuantConnect.DataLibrary.Tests
 {
     /// <summary>
     /// Example algorithm using the SEC Form 13F institutional holdings dataset as a source of alpha.
-    /// It subscribes the dataset on three large, long-listed US equities and reads the individual
-    /// positions managers reported on each, then holds the name the most managers report.
+    /// It follows one manager, Pershing Square, through seven of the names it reports: it holds
+    /// them all when the first quarter arrives, and from then on only those the manager added to.
     ///
-    /// The dataset publishes what each manager filed and nothing else, so the breadth this trades
-    /// on is counted here, in the algorithm: a point is every position reported for the security on
-    /// one filing date, and distinct managers are distinct CIKs among them. Counting rather than
-    /// reading a published total is the whole shape of the dataset, since no filing states how many
-    /// managers hold a name.
+    /// The dataset publishes what each manager filed and nothing else, so the change this trades on
+    /// is worked out here: a point is every position reported for the security on one filing date,
+    /// the manager's lines are picked out by CIK, and the quarter they describe is PeriodEnd.
     ///
     /// The 13F symbols returned by AddData are signals, not tradeable securities, so every name is
     /// added twice: once as the tradeable equity and once as the custom data subscribed on it.
     /// </summary>
     public class SEC13FAlgorithm : QCAlgorithm
     {
-        /// <summary>Tradeable equity symbol, keyed by the 13F data symbol subscribed on it.</summary>
-        private readonly Dictionary<Symbol, Symbol> _equityByDataSymbol = new Dictionary<Symbol, Symbol>();
-
         /// <summary>
-        /// Managers seen reporting each equity for the quarter being accumulated, by filer CIK.
-        /// A manager files once per quarter, on a day of its own choosing, so breadth is built up
-        /// across filing dates rather than read off any single one.
+        /// Pershing Square Capital Management, and Pershing Square Inc., which has reported the same
+        /// positions since the June 2026 quarter while the former files only a notice. A manager is
+        /// followed by CIK, and a change of reporting entity is a change of CIK.
         /// </summary>
-        private readonly Dictionary<Symbol, HashSet<int>> _managersByEquity = new Dictionary<Symbol, HashSet<int>>();
+        private static readonly HashSet<int> Managers = [1336528, 2026053];
 
-        private Symbol _invested;
+        /// <summary>The shares the manager reported for each equity, by the quarter they describe.</summary>
+        private readonly Dictionary<Symbol, SortedDictionary<DateTime, decimal>> _sharesByEquity = [];
+
+        private bool _rebalance;
 
         /// <summary>
         /// Initialise the data and resolution required, as well as the cash and start-end dates.
         /// </summary>
         public override void Initialize()
         {
-            // The dataset runs 2013-05-20 to 2026-05-29, which is where the SEC's structured 13F
-            // tables begin. This window sits inside it and holds one whole quarterly cycle: the
-            // September 2020 quarter fills in from a handful of managers in early October to
-            // thousands by the middle of November, while the June quarter it replaces finishes.
-            SetStartDate(2020, 10, 1);
-            SetEndDate(2020, 12, 31);
+            // Two filings fall in this window: the March 2026 quarter, filed on 15 May, and the June
+            // quarter, filed on 14 August. Each reaches the algorithm at midnight after its filing date.
+            SetStartDate(2026, 5, 1);
+            SetEndDate(2026, 8, 31);
             SetCash(100000);
 
-            // AAPL is one of the names whose identity chain was validated against published
-            // institutional ownership. GOOGL is here on purpose too: its CUSIP is not in the
-            // security database, so it is reachable only through the N-PORT ticker crosswalk, and
-            // seeing it arrive proves the whole chain rather than just its first step.
-            foreach (var ticker in new[] { "AAPL", "GOOGL", "SPY" })
+            foreach (var ticker in new[] { "META", "UBER", "QSR", "MSFT", "BN", "HTZ", "AMZN" })
             {
                 var equity = AddEquity(ticker, Resolution.Daily).Symbol;
-                var dataSymbol = AddData<SEC13FHoldings>(equity).Symbol;
-                _equityByDataSymbol[dataSymbol] = equity;
-                _managersByEquity[equity] = new HashSet<int>();
+                AddData<SEC13FHoldings>(equity);
+                _sharesByEquity[equity] = [];
             }
         }
 
@@ -82,55 +75,64 @@ namespace QuantConnect.DataLibrary.Tests
         /// <param name="slice">Slice object keyed by symbol containing the data</param>
         public override void OnData(Slice slice)
         {
-            foreach (var kvp in _equityByDataSymbol)
+            foreach (var (dataSymbol, point) in slice.Get<SEC13FHoldings>())
             {
-                if (!slice.ContainsKey(kvp.Key))
+                // The data symbol carries the equity it was subscribed on as its underlying.
+                var equity = dataSymbol.Underlying;
+
+                // One point per filing date, carrying every position every manager reported for the
+                // security that day. An amendment would restate lines already counted and an option
+                // line states the shares under the contracts, so both are left out of the share count.
+                foreach (var holding in point.OfType<SEC13FHolding>().Where(holding =>
+                             Managers.Contains(holding.ManagerCik) && holding.FormType == "13F-HR" &&
+                             holding.AmountType == "SH" && !holding.PutCall.HasValue))
                 {
-                    continue;
-                }
+                    var shares = _sharesByEquity[equity];
+                    shares[holding.PeriodEnd] = shares.GetValueOrDefault(holding.PeriodEnd) + (holding.Amount ?? 0);
+                    _rebalance = true;
 
-                // One point per filing date, carrying every position reported for the security that
-                // day. Several managers file on the same day and a single manager can report the
-                // security on more than one line, which the rules allow when the discretion
-                // differs, so records outnumber managers.
-                SEC13FHoldings point = slice[kvp.Key];
-                var equity = kvp.Value;
-
-                foreach (SEC13FHolding holding in point)
-                {
-                    // PeriodEnd is the quarter the position describes, typically 45 to 135 days
-                    // before the filing date the point is stamped with. Option lines state the
-                    // shares underlying the contracts and are left out of a share count.
-                    Log($"{Time:yyyy-MM-dd} {equity.Value} - CIK {holding.ManagerCik} for {holding.PeriodEnd:yyyy-MM-dd}: " +
-                        $"{holding.Amount} {holding.AmountType}, {holding.MarketValue:C0}{(holding.PutCall.HasValue ? $" ({holding.PutCall})" : "")}");
-
-                    if (!holding.PutCall.HasValue && holding.AmountType == "SH")
-                    {
-                        _managersByEquity[equity].Add(holding.ManagerCik);
-                    }
+                    Log($"{Time:yyyy-MM-dd} {equity.Value} - {holding.ManagerName} reports {holding.Amount:N0} shares, " +
+                        $"{holding.MarketValue:C0}, for {holding.PeriodEnd:yyyy-MM-dd}");
                 }
             }
 
-            // Hold the name the most managers report. Rebalancing only when the leader changes keeps
-            // the demo down to a handful of orders.
-            var leader = _managersByEquity
-                .Where(kvp => kvp.Value.Count > 0)
-                .OrderByDescending(kvp => kvp.Value.Count)
-                .ThenBy(kvp => kvp.Key.Value)
-                .Select(kvp => kvp.Key)
-                .FirstOrDefault();
-
             // A 13F point arrives at midnight the day after its filing date, which is not
-            // necessarily a day the equity prints a bar, so the order waits for a price rather than
-            // firing against a stale one.
-            if (leader == null || leader == _invested || !slice.Bars.ContainsKey(leader))
+            // necessarily a day the equities print a bar, so the orders wait for prices.
+            if (!_rebalance || slice.Bars.Count == 0)
             {
                 return;
             }
 
-            _invested = leader;
-            Log($"{Time:yyyy-MM-dd} most widely held name is now {leader.Value}, rotating into it");
-            SetHoldings(leader, 1, liquidateExistingHoldings: true);
+            _rebalance = false;
+
+            // The manager's trades, which no filing states: the change between two reported quarters.
+            foreach (var (equity, shares) in _sharesByEquity.Where(kvp => kvp.Value.Count > 1))
+            {
+                var (previous, latest) = (shares.Values.ElementAt(shares.Count - 2), shares.Values.Last());
+                Log($"{Time:yyyy-MM-dd} {equity.Value}: {previous:N0} -> {latest:N0} shares ({latest / previous - 1:+0.0%;-0.0%}) " +
+                    $"between {shares.Keys.ElementAt(shares.Count - 2):yyyy-MM-dd} and {shares.Keys.Last():yyyy-MM-dd}");
+            }
+
+            // With one quarter known, hold what the manager holds. With two, hold what it added to.
+            var selected = _sharesByEquity
+                .Where(kvp => kvp.Value.Count > 0)
+                .Where(kvp =>
+                {
+                    var quarters = kvp.Value.Values.ToList();
+                    return quarters.Count == 1 ? quarters[0] > 0 : quarters[^1] > quarters[^2];
+                })
+                .Select(kvp => kvp.Key)
+                .ToList();
+
+            if (selected.Count == 0)
+            {
+                Liquidate();
+                return;
+            }
+
+            Log($"{Time:yyyy-MM-dd} holding {string.Join(", ", selected.Select(symbol => symbol.Value))}");
+            SetHoldings(selected.Select(symbol => new PortfolioTarget(symbol, 1m / selected.Count)).ToList(),
+                liquidateExistingHoldings: true);
         }
 
         /// <summary>

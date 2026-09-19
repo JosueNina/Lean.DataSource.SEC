@@ -27,8 +27,8 @@ it.
 
 A record's `Time` is its filing date and its `EndTime` is midnight that night. LEAN emits a point at
 its end time, so a day's filings all reach the algorithm at 00:00 the following day, after EDGAR has
-finished listing that day at about 22:05 ET. History and live carry the same stamp, so a backtest
-never reads a filing before it existed.
+finished listing that day at about 22:05 ET, so a backtest never reads a filing before it existed.
+A filing whose EDGAR index came days late is added to history under its filing date.
 
 An algorithm receives one `SEC13FHoldings` point per security per filing date, holding every
 position reported for that security that day. Several managers file on the same day, and a single
@@ -86,7 +86,8 @@ Each record in a point carries the following fields, exactly as the manager file
 | Property | Meaning |
 | --- | --- |
 | `AccessionNumber` | EDGAR accession number of the submission the line was reported on |
-| `ManagerCik` | Central Index Key of the filing manager; the names are in managers.csv |
+| `ManagerCik` | Central Index Key of the filing manager, its stable identity across name changes |
+| `ManagerName` | The manager's name as its most recent cover page states it, null for an unknown CIK |
 | `PeriodEnd` | End of the quarter the position is reported for, the SEC PERIODOFREPORT |
 | `FormType` | 13F-HR for a holdings report, 13F-HR/A for an amendment |
 | `AmendmentType` | On an amendment, whether it restates the whole report or only adds holdings |
@@ -99,7 +100,7 @@ Each record in a point carries the following fields, exactly as the manager file
 | `MarketValue` | `ReportedValue` in whole dollars, derived from the two above and never stored |
 | `PutCall` | Call or Put when the line is an option on the security, null when it is the security |
 | `InvestmentDiscretion` | SOLE, DFND or OTR, as the filing states it |
-| `OtherManager` | The other managers sharing the position, as the cover page numbers them |
+| `OtherManager` | The other managers sharing the position, as the cover page numbers them, separated by semicolons; empty when there are none |
 | `VotingSole` | Shares over which the manager holds sole voting authority |
 | `VotingShared` | Shares over which the manager shares voting authority |
 | `VotingNone` | Shares over which the manager holds no voting authority |
@@ -143,6 +144,14 @@ and the filer has already declared which kind of amendment it made, so the algor
 Most amendments restate the whole report, which is what `RESTATEMENT` in `AmendmentType` means;
 `NEW HOLDINGS` adds to the original.
 
+### A manager can change CIK
+
+A manager whose positions are reported on another manager's filing files a 13F-NT, a notice that
+carries no positions and contributes no records. Pershing Square Capital Management (CIK 1336528)
+reported its own positions through the March 2026 quarter and has filed a notice since, while
+Pershing Square Inc. (CIK 2026053) reports them. Followed by the first CIK alone, the fund appears
+to sell everything in one quarter, so follow every CIK the manager has reported under.
+
 ### Coverage is partial by design
 
 Holdings are keyed by CUSIP in the source and resolved to a LEAN `Symbol` before publication, so no
@@ -157,12 +166,18 @@ one before it could not reach:
 3. The ticker the SEC's own Form N-PORT filings report for the CUSIP, taken back to a `Symbol`
    through the map files. This step needs no security database at all and it is what reaches the
    foreign domiciled issuers whose identifier is really a CINS, for which a constructed US ISIN is
-   wrong by construction. Alphabet is one of them, which is why `GOOGL` appears in the demonstration
-   algorithms.
+   wrong by construction. Alphabet is one of them.
 4. For an option line, the security the option is written on. A manager reporting options names them
    by the option's own CUSIP, which carries the underlying's six character issuer and issue 90 for
    calls or 95 for puts and appears in no security database. The position is still published as the
-   option line it is, with its side in `PutCall`.
+   option line it is, with its side in `PutCall`; a line that names no side takes the one its CUSIP
+   states. Where the issuer has several funds, as iShares does, every fund's options share one CUSIP,
+   and each line goes to the one fund whose quarter-end close its implied price matches, or is dropped.
+
+A security's file holds what managers reported under its CUSIP, which is not always the common
+stock: filers put preferred shares, units and convertibles under the common's CUSIP, and
+`TitleOfClass` is the only field that says so. `ValueScale` takes the values 3, 0 and -3, so a
+filing stated in millions is not brought to dollars.
 
 A fund's reported ticker in step 3 is free text, so that step keeps a match only when the reported
 prices do not say otherwise. A group is dropped when three or more of its prices are not the
@@ -199,7 +214,8 @@ Examples include the following strategies:
 - Building an ownership change momentum signal from the quarter over quarter move in reported
   shares, and going long the names institutions are accumulating.
 - Following one manager through `ManagerCik`, reading what a single fund reported quarter after
-  quarter rather than what the market did in aggregate.
+  quarter rather than what the market did in aggregate, which is what the demonstration algorithms
+  do with Pershing Square.
 - Screening out thinly followed names, requiring a minimum number of reporting managers before a
   security is tradeable.
 - Reading the reported put and call lines alongside the share positions to see whether managers are

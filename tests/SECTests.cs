@@ -19,6 +19,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using ProtoBuf;
+using ProtoBuf.Meta;
 using Newtonsoft.Json;
 using NUnit.Framework;
 using QuantConnect.Data;
@@ -46,9 +47,7 @@ namespace QuantConnect.DataLibrary.Tests
             var expected = CreateNewInstance();
             var type = expected.GetType();
 
-            // The sub type is registered once for the whole assembly, in ProtobufSubTypes: the
-            // model freezes as soon as anything is serialized, so a registration here would throw
-            // for whichever round trip test did not run first.
+            RuntimeTypeModel.Default[typeof(BaseData)].AddSubType(2000, type);
 
             using (var stream = new MemoryStream())
             {

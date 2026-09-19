@@ -37,7 +37,7 @@ using QuantConnect.Util;
 namespace QuantConnect.DataProcessing
 {
     /// <summary>
-    /// Converts Form 13F filings into LEAN's per-security files, one entry per filing date
+    /// Converts Form 13F filings into LEAN's per-security zips, one entry per filing
     /// date. Without QC_DATAFLEET_DEPLOYMENT_DATE it rebuilds the whole history, from the SEC's
     /// structured data sets through the last window published and from EDGAR's daily indexes after
     /// it; with it, it reads that day from EDGAR, with any recent day whose index came late, and
@@ -70,16 +70,10 @@ namespace QuantConnect.DataProcessing
         // carries no INFOTABLE at all, so it is not a zero position and must not become one.
         private const string NoticeSubmissionTypePrefix = "13F-NT";
 
-        // A 13F-HR/A amends the manager's report for the quarter, and most restate all of it, so an
-        // amendment's lines count only for a security the manager had not reported yet. A
-        // restatement's corrections to a position already counted are not applied; see AdmitAmendment.
-        private const string AmendmentSubmissionTypeSuffix = "/A";
-
         // EDGAR lists a day's filings in its daily index at about 22:05 ET (02:02 to 02:07 UTC the
         // next morning over six business days measured in September 2026). The daily job reads that
         // index at 01:00 ET the next day with a one hour timeout (schedule "0 1 * * 2-6", Date
-        // Offset 1), so a filing is published the day after its FILING_DATE at ReleaseTimeOfDay.
-        // Stamping it any earlier would let a backtest read it before the live job had it.
+        // Offset 1), which is why a point ends at midnight after its FILING_DATE and no earlier.
 
         /// <summary>Config key that starts the rebuild's EDGAR days on this yyyyMMdd instead of after the last data set.</summary>
         internal const string EdgarFromKey = "sec-13f-edgar-from";
@@ -106,25 +100,10 @@ namespace QuantConnect.DataProcessing
         /// <summary>How far back a daily run looks for a day whose index EDGAR published late.</summary>
         private const int EdgarLookbackDays = 10;
 
-        private const string ReleaseFormat = "yyyyMMdd HH:mm";
         private const string PeriodFormat = "yyyyMMdd";
-
-        // A staged row: release, period, the eight measures and the confidential flag.
-        private const int FirstValueColumn = 2;
-        private const int ValueColumnCount = 8;
-        private const int PublishedColumnCount = FirstValueColumn + ValueColumnCount + 1;
-
-        // A published line: the release stamp, how many quarters it restates, and then that many
-        // groups of columns, one per quarter. Every quarter a release restates travels in one line,
-        // since LEAN hands an algorithm a single data point per security per timestamp.
-        private const int PointHeaderColumns = 2;
-        private const int GroupColumnCount = ValueColumnCount + 2;
 
         // N-PORT quarters folded into the crosswalk: a year reaches every security still trading.
         private const int NPortQuartersToFold = 4;
-
-        /// <summary>Days after a quarter end that managers have to file their 13F for it.</summary>
-        private const int FilingDeadlineDays = 45;
 
         // The SEC rule: VALUE in thousands for filings before this date, whole dollars from it.
         // DetectValueUnits checks each filing against it.
@@ -197,20 +176,14 @@ namespace QuantConnect.DataProcessing
             _pendingSecurityRows = new(StringComparer.Ordinal);
 
         /// <summary>
-        /// Where increments wait, one file per security, until the finalize pass. Per security
-        /// because the running total belongs to the security and not to a ticker, and outside the
-        /// output folder because everything there is published.
+        /// Where rows wait, one file per security, until the finalize pass. Outside the output
+        /// folder because everything there is published.
         /// </summary>
         private readonly string _stagingDirectory =
             Path.Combine(Path.GetTempPath(), "sec-13f-staging", Guid.NewGuid().ToString("N"));
 
-        /// <summary>Every security with increments staged, which is every security this run touched.</summary>
+        /// <summary>Every security with rows staged, which is every security this run touched.</summary>
         private readonly HashSet<string> _stagedSecurities = new(StringComparer.Ordinal);
-
-        /// <summary>
-        /// Amendments admitted in this archive, as (filer key, filing date), so one amendment naming
-        /// several CUSIPs of a security is admitted for all of them.
-        /// </summary>
 
         /// <summary>Ticker and date to the security the map files say owns that ticker then, per archive.</summary>
         private readonly Dictionary<(string Ticker, DateTime Date), string> _tickerOwners = new();
@@ -254,6 +227,13 @@ namespace QuantConnect.DataProcessing
         /// administrator's ticker can name another company.
         /// </summary>
         private readonly HashSet<(string Cusip, DateTime Date)> _crosswalkResolutions = new();
+
+        /// <summary>CUSIPs and filing dates resolved through the security an option is written on.</summary>
+        private readonly HashSet<(string Cusip, DateTime Date)> _optionResolutions = new();
+
+        private long _optionSidesInferred;
+        private long _optionLinesByPrice;
+        private long _optionLinesWithoutOneMatch;
 
         private long _debtCusipsRejected;
         private long _mismatchedGroups;
@@ -481,7 +461,7 @@ namespace QuantConnect.DataProcessing
             }
 
             var published = Directory.Exists(_processedDataDirectory)
-                ? Directory.EnumerateFiles(_processedDataDirectory, "*.csv").Count()
+                ? Directory.EnumerateFiles(_processedDataDirectory, "*.zip").Count()
                 : 0;
 
             if (published == 0)
@@ -661,6 +641,7 @@ namespace QuantConnect.DataProcessing
             // filing date, so entries from a window already read can never be hit again.
             _resolvedCusips.Clear();
             _crosswalkResolutions.Clear();
+            _optionResolutions.Clear();
             _tickerOwners.Clear();
 
             var path = DownloadArchive(archive);
@@ -705,9 +686,6 @@ namespace QuantConnect.DataProcessing
 
             /// <summary>The submission type as filed, 13F-HR or 13F-HR/A.</summary>
             public string FormType { get; init; }
-
-            /// <summary>True for a 13F-HR/A, which restates a report this filer already made.</summary>
-            public bool IsAmendment { get; init; }
 
             /// <summary>
             /// Whether an amendment restates the whole report or only adds holdings, as the filer
@@ -759,8 +737,7 @@ namespace QuantConnect.DataProcessing
                     Cik = int.Parse(fields[columns["CIK"]], NumberStyles.Integer, CultureInfo.InvariantCulture),
                     FilingDate = ParseSecDate(fields[columns["FILING_DATE"]], archive, "FILING_DATE"),
                     Period = ParseSecDate(fields[columns["PERIODOFREPORT"]], archive, "PERIODOFREPORT"),
-                    FormType = submissionType.Trim(),
-                    IsAmendment = submissionType.EndsWith(AmendmentSubmissionTypeSuffix, StringComparison.OrdinalIgnoreCase)
+                    FormType = submissionType.Trim()
                 };
             }
 
@@ -819,7 +796,8 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
-                var name = Sanitize(fields[columns["FILINGMANAGER_NAME"]]);
+                // managers.csv is split on its first comma only, so a name keeps its own.
+                var name = fields[columns["FILINGMANAGER_NAME"]].Trim();
                 if (name.Length > 0)
                 {
                     submission.ManagerName = name;
@@ -870,6 +848,20 @@ namespace QuantConnect.DataProcessing
             return value.Trim().Replace(',', ' ').Replace('"', ' ').Trim();
         }
 
+        private static readonly Regex OtherManagerSeparator = new(@"[,;\s]+", RegexOptions.Compiled);
+
+        /// <summary>
+        /// The other managers' sequence numbers joined by semicolons. Filers separate them with
+        /// commas, spaces or both, and write NONE or 0 when there are none, which comes out empty.
+        /// </summary>
+        internal static string FormatOtherManagers(string value)
+        {
+            return string.Join(';', OtherManagerSeparator.Split(value.Replace('"', ' ').Trim())
+                .Where(token => token.Length > 0 && token != "0" &&
+                                !token.Equals("NONE", StringComparison.OrdinalIgnoreCase) &&
+                                !token.Equals("N/A", StringComparison.OrdinalIgnoreCase)));
+        }
+
         /// <summary>
         /// One line of one filing's information table, carried through to publication unchanged.
         /// Nothing is added to anything: two managers reporting the same security on the same day,
@@ -890,7 +882,7 @@ namespace QuantConnect.DataProcessing
             /// <summary>The power of ten that turns <see cref="ReportedValue"/> into whole dollars.</summary>
             public int ValueScale { get; init; }
 
-            public string PutCall { get; init; }
+            public string PutCall { get; set; }
             public string InvestmentDiscretion { get; init; }
             public string OtherManager { get; init; }
             public decimal? VotingSole { get; init; }
@@ -966,8 +958,8 @@ namespace QuantConnect.DataProcessing
 
                 var shareType = fields[columns["SSHPRNAMTTYPE"]].Trim();
                 var putCall = fields[columns["PUTCALL"]].Trim();
-                var amount = ParseDecimal(fields[columns["SSHPRNAMT"]]);
-                var value = ParseDecimal(fields[columns["VALUE"]]);
+                var amount = ParseOptionalDecimal(fields[columns["SSHPRNAMT"]]);
+                var value = ParseOptionalDecimal(fields[columns["VALUE"]]);
 
                 // Only a plain share line says anything about the unit the filing reports values in,
                 // and only those prices are worth comparing with a close, so the crosswalk check is
@@ -975,15 +967,17 @@ namespace QuantConnect.DataProcessing
                 var isShareLine = putCall.Length == 0 && shareType.Equals("SH", StringComparison.OrdinalIgnoreCase);
                 if (isShareLine && value > 0m && amount > 0m)
                 {
-                    group.SharePrices.Add((double)(value / amount));
+                    group.SharePrices.Add((double)(value.Value / amount.Value));
                 }
 
-                // The unit is detected per line, as before, but it is now recorded beside the value
-                // the manager reported instead of being multiplied into it. A line the detector has
-                // nothing to say about keeps its filing's reading. The factor runs both ways: a
-                // filing still in thousands after 2023 is scaled up, and a line that overstated its
-                // value a thousandfold is brought back down.
-                var scale = ScaleOf(units.Factor(accession, cusip, submission, value, amount));
+                // The unit is recorded beside the value the manager reported rather than multiplied
+                // into it. It runs both ways: a filing still in thousands after 2023 is scaled up, and
+                // a line that overstated its value a thousandfold is brought back down. Only a share
+                // line has a price to check against the close; an option or a bond at par would land
+                // on a step by chance, so those keep their filing's unit.
+                var scale = ScaleOf(isShareLine
+                    ? units.Factor(accession, cusip, submission, value ?? 0m, amount ?? 0m)
+                    : units.Filing(accession));
 
                 group.Lines.Add(new PositionLine
                 {
@@ -995,10 +989,10 @@ namespace QuantConnect.DataProcessing
                     ValueScale = scale,
                     PutCall = Sanitize(putCall),
                     InvestmentDiscretion = Sanitize(fields[columns["INVESTMENTDISCRETION"]]),
-                    OtherManager = Sanitize(fields[columns["OTHERMANAGER"]]).Replace(' ', ';'),
-                    VotingSole = ParseDecimal(fields[columns["VOTING_AUTH_SOLE"]]),
-                    VotingShared = ParseDecimal(fields[columns["VOTING_AUTH_SHARED"]]),
-                    VotingNone = ParseDecimal(fields[columns["VOTING_AUTH_NONE"]])
+                    OtherManager = FormatOtherManagers(fields[columns["OTHERMANAGER"]]),
+                    VotingSole = ParseOptionalDecimal(fields[columns["VOTING_AUTH_SOLE"]]),
+                    VotingShared = ParseOptionalDecimal(fields[columns["VOTING_AUTH_SHARED"]]),
+                    VotingNone = ParseOptionalDecimal(fields[columns["VOTING_AUTH_NONE"]])
                 });
 
                 lines++;
@@ -1123,6 +1117,9 @@ namespace QuantConnect.DataProcessing
                 _marketOffset = marketOffset;
             }
 
+            /// <summary>The factor decided for a whole filing, which a line with no price of its own takes.</summary>
+            public decimal Filing(string accession) => _filings[accession];
+
             /// <summary>The factor for one share line of VALUE <paramref name="value"/> over <paramref name="amount"/> shares.</summary>
             public decimal Factor(string accession, string cusip, Submission submission, decimal value, decimal amount)
             {
@@ -1202,9 +1199,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Resolves each group to a security and queues its increment, the filings of that day only;
-        /// the finalize pass turns increments into running totals. Groups that resolve to nothing,
-        /// mostly foreign issuers, are dropped.
+        /// Resolves each group to a security and queues its lines for that security's file. Groups
+        /// that resolve to nothing, mostly foreign issuers, are dropped.
         /// </summary>
         private void EmitHoldings(Dictionary<HoldingKey, Holding> holdings)
         {
@@ -1213,6 +1209,12 @@ namespace QuantConnect.DataProcessing
                 foreach (var (key, holding) in day)
                 {
                     var security = ResolveSecurity(key.Cusip, key.FilingDate);
+                    if (security == null && OptionUnderlyings(key.Cusip).Count > 1)
+                    {
+                        EmitOptionLinesByPrice(key, holding);
+                        continue;
+                    }
+
                     var ticker = security == null ? null : ResolveTicker(security, key.FilingDate);
                     if (string.IsNullOrWhiteSpace(ticker) || !IsFileNameSafe(ticker))
                     {
@@ -1265,8 +1267,14 @@ namespace QuantConnect.DataProcessing
                     // original it restates rather than replacing it: deciding that a restatement
                     // supersedes a number is a judgement about the data, and the filer already
                     // declared which kind it is in AmendmentType for whoever wants to apply it.
+                    var throughOption = _optionResolutions.Contains((key.Cusip, key.FilingDate));
                     foreach (var line in holding.Lines)
                     {
+                        if (throughOption)
+                        {
+                            InferOptionSide(key.Cusip, line);
+                        }
+
                         Queue(security.ToString(), ticker.ToLowerInvariant(), new HoldingsRow
                         {
                             Time = key.FilingDate,
@@ -1275,6 +1283,78 @@ namespace QuantConnect.DataProcessing
                     }
                 }
             }
+        }
+
+        /// <summary>
+        /// Gives a line under an option CUSIP the side it left empty, which would otherwise read as
+        /// shares of the underlying. The CUSIP states it: issue 90 is a call and 95 a put, and where
+        /// the line does name a side the two agree on 24,890 of 24,915 lines of the June to August
+        /// 2026 data set.
+        /// </summary>
+        private void InferOptionSide(string cusip, PositionLine line)
+        {
+            if (FormatPutCall(line.PutCall).Length > 0)
+            {
+                return;
+            }
+
+            line.PutCall = NormalizeCusip(cusip).Substring(IssuerLength, 2) == OptionIssues[0] ? "Call" : "Put";
+            _optionSidesInferred++;
+        }
+
+        /// <summary>
+        /// How far an option line's implied price may sit from a fund's close and still name it. Tight,
+        /// unlike the unit check, because it has to tell the funds of one family apart, and it can be:
+        /// filers value the line at that close. On the March 2026 quarter half a percent gave 1,383
+        /// of 2,114 lines one fund and 63 several, where three percent gave 958 and 659.
+        /// </summary>
+        private const double OptionPriceTolerance = 0.005;
+
+        /// <summary>
+        /// Publishes the lines of an option CUSIP whose issuer has several equity issues, as the fund
+        /// families do: every iShares fund's calls share one CUSIP, so each line is resolved on its
+        /// own. An option line reports the value and the number of the underlying shares, so its
+        /// implied price is the underlying's, and the line goes to the one issue whose quarter-end
+        /// close it matches, in dollars or in thousands. No match, or more than one, drops the line.
+        /// </summary>
+        private void EmitOptionLinesByPrice(HoldingKey key, Holding holding)
+        {
+            var candidates = OptionUnderlyings(key.Cusip)
+                .Select(issue => TradingDefinition(_definitionsByCusip, issue,
+                    BuildUnitedStatesIsin(issue + ComputeCusipCheckDigit(issue)), key.FilingDate))
+                .Where(security => security != null)
+                .Distinct()
+                .Select(security => (Security: security, Close: _closePrices.Close(security, key.Period, key.FilingDate)))
+                .Where(candidate => candidate.Close != null)
+                .ToList();
+
+            foreach (var line in holding.Lines)
+            {
+                var matches = line.Amount > 0m && line.ReportedValue > 0m
+                    ? candidates.Where(candidate => MatchesClose(line.ReportedValue.Value / line.Amount.Value, candidate.Close.Value)).ToList()
+                    : [];
+
+                var ticker = matches.Count == 1 ? ResolveTicker(matches[0].Security, key.FilingDate) : null;
+                if (string.IsNullOrWhiteSpace(ticker) || !IsFileNameSafe(ticker))
+                {
+                    _optionLinesWithoutOneMatch++;
+                    _unresolvedValue += line.DollarValue;
+                    continue;
+                }
+
+                InferOptionSide(key.Cusip, line);
+                _optionLinesByPrice++;
+                _resolvedValue += line.DollarValue;
+                Queue(matches[0].Security.ToString(), ticker.ToLowerInvariant(), new HoldingsRow { Time = key.FilingDate, Line = line });
+            }
+        }
+
+        /// <summary>Whether a price is a close, stated in dollars or in thousands, within OptionPriceTolerance.</summary>
+        internal static bool MatchesClose(decimal price, decimal close)
+        {
+            var ratio = price / close;
+            return Math.Abs((double)ratio - 1) <= OptionPriceTolerance ||
+                   Math.Abs((double)ratio * 1000 - 1) <= OptionPriceTolerance;
         }
 
         /// <summary>
@@ -1379,11 +1459,17 @@ namespace QuantConnect.DataProcessing
                         }
 
                         _resolvedCusips[key] = security;
+                        _optionResolutions.Add(key);
                         return security;
                     }
                 }
 
-                _unresolvedCusips.Add(cusip);
+                // Several possible underlyings: its lines are resolved one by one, by price.
+                if (OptionUnderlyings(cusip).Count <= 1)
+                {
+                    _unresolvedCusips.Add(cusip);
+                }
+
                 _resolvedCusips[key] = null;
                 return null;
             }
@@ -1477,6 +1563,12 @@ namespace QuantConnect.DataProcessing
         /// </summary>
         internal static string NormalizeCusip(string cusip)
         {
+            // Anything else cannot be put in an ISIN, and one such line would stop the run there.
+            if (!cusip.All(char.IsAsciiLetterOrDigit))
+            {
+                return null;
+            }
+
             if (cusip.Length == 9)
             {
                 return cusip;
@@ -1639,6 +1731,13 @@ namespace QuantConnect.DataProcessing
             return nine != null && char.IsDigit(nine[6]) && char.IsDigit(nine[7]);
         }
 
+        /// <summary>
+        /// Whether a CUSIP is a CINS, the form foreign issuers carry: it opens with the letter of the
+        /// issuer's country or region, where a US or Canadian one opens with a digit. Many trade in
+        /// the US all the same, as Accenture and Medtronic do, so it sorts the summary and filters nothing.
+        /// </summary>
+        internal static bool IsCins(string cusip) => cusip.Length > 0 && char.IsAsciiLetter(cusip[0]);
+
         /// <summary>How many characters of a CUSIP name the issuer, before the issue and the check digit.</summary>
         private const int IssuerLength = 6;
 
@@ -1673,13 +1772,18 @@ namespace QuantConnect.DataProcessing
                 return null;
             }
 
-            if (!_equityIssuesByIssuer.TryGetValue(nine.Substring(0, IssuerLength), out var issues) ||
-                issues.Count != 1)
-            {
-                return null;
-            }
+            var issues = OptionUnderlyings(nine);
+            return issues.Count == 1 ? issues[0] : null;
+        }
 
-            return issues[0];
+        /// <summary>The equity issues, as eight character CUSIPs, an option CUSIP can be written on.</summary>
+        internal List<string> OptionUnderlyings(string cusip)
+        {
+            var nine = NormalizeCusip(cusip);
+            return nine != null && IsOptionIssue(nine) &&
+                   _equityIssuesByIssuer.TryGetValue(nine.Substring(0, IssuerLength), out var issues)
+                ? issues
+                : [];
         }
 
         /// <summary>
@@ -1805,8 +1909,7 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Queues an increment for a security, to be staged when the archive is done, summing it into
-        /// whatever this archive already holds for the same quarter and release date.
+        /// Queues a row for a security, to be staged when the archive is done.
         /// </summary>
         private void Queue(string security, string ticker, HoldingsRow row)
         {
@@ -1846,10 +1949,8 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Turns the staged increments into the running total per quarter and writes the ticker
-        /// files. The total is kept per security, so a quarter still filing at a rename carries on in
-        /// the new ticker's file. An incremental run folds in the security's published rows from
-        /// every ticker it traded under, and keeps the rows of other securities in a shared file.
+        /// Gathers the staged rows into their ticker's zip, one entry per filing date. An incremental
+        /// run adds its dates to a copy of the published zip.
         /// </summary>
         internal void FinalizeSecurityFiles()
         {
@@ -1871,6 +1972,9 @@ namespace QuantConnect.DataProcessing
                     File.AppendAllLines(Path.Combine(tickerStaging, $"{ticker.Key}.csv"),
                         ticker.Select(entry => FormatRow(entry.Row)));
                 }
+
+                // Deleted as it goes: the whole history staged twice, uncompressed, is tens of gigabytes.
+                File.Delete(StagingPath(security));
             }
 
             Directory.CreateDirectory(_destinationDirectory);
@@ -1888,6 +1992,7 @@ namespace QuantConnect.DataProcessing
 
                 entries += WriteSecurityZip(ticker, days);
                 rows += days.Sum(day => day.LongCount());
+                File.Delete(file);
             }
 
             Log.Trace($"SEC13FDownloader.FinalizeSecurityFiles(): {_stagedSecurities.Count} securities written into " +
@@ -1898,21 +2003,27 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
-        /// Writes one security's filing dates, as an entry per date inside its zip, and the index of
-        /// those dates beside it.
+        /// Writes one security's filing dates as an entry per date inside its zip.
         ///
         /// A zip rather than a directory of loose files because a filing date holds three lines at
         /// the median and one line a third of the time: as loose files the history would be eight
-        /// and a half million of them, whose tar headers alone outweigh the data. An incremental run
-        /// adds the dates it read and leaves every other entry untouched, so a day is written once.
+        /// and a half million of them, whose tar headers alone outweigh the data.
         /// </summary>
         private long WriteSecurityZip(string ticker, List<IGrouping<DateTime, HoldingsRow>> days)
         {
             var path = Path.Combine(_destinationDirectory, $"{ticker}.zip");
 
+            // The destination starts empty and whatever lands in it replaces the published file, so
+            // an incremental run adds its dates to a copy of the published zip. Without the copy it
+            // would publish the security's history as this run's dates alone.
+            var published = Path.Combine(_processedDataDirectory, $"{ticker}.zip");
+            if (_deploymentDate != null && File.Exists(published))
+            {
+                File.Copy(published, path);
+            }
+
             // Update mode only when there is a zip to update. A new one is opened in Create mode,
-            // which streams its entries out instead of holding the archive in memory, and which
-            // cannot be asked for its entries at all.
+            // which streams its entries out instead of holding the archive in memory.
             var updating = File.Exists(path);
 
             using (var zip = ZipFile.Open(path, updating ? ZipArchiveMode.Update : ZipArchiveMode.Create))
@@ -1928,7 +2039,8 @@ namespace QuantConnect.DataProcessing
                         zip.GetEntry(name)?.Delete();
                     }
 
-                    using var writer = new StreamWriter(zip.CreateEntry(name, CompressionLevel.Optimal).Open());
+                    // The same bytes whichever system the job runs on.
+                    using var writer = new StreamWriter(zip.CreateEntry(name, CompressionLevel.Optimal).Open()) { NewLine = "\n" };
                     foreach (var row in day)
                     {
                         writer.WriteLine(FormatRow(row));
@@ -1936,19 +2048,8 @@ namespace QuantConnect.DataProcessing
                 }
             }
 
-            // The index names the dates the zip holds, so that whoever wants to know when a security
-            // was reported does not have to open it. It is read back from the zip rather than from
-            // the run, so that an incremental run lists the dates it did not touch as well.
-            using (var zip = ZipFile.OpenRead(path))
-            {
-                File.WriteAllLines(
-                    Path.Combine(_destinationDirectory, $"{ticker}.csv"),
-                    zip.Entries
-                        .Select(entry => Path.GetFileNameWithoutExtension(entry.Name))
-                        .OrderBy(name => name, StringComparer.Ordinal));
-
-                return zip.Entries.Count;
-            }
+            using var written = ZipFile.OpenRead(path);
+            return written.Entries.Count;
         }
 
         /// <summary>
@@ -2047,16 +2148,16 @@ namespace QuantConnect.DataProcessing
                             : DateTime.ParseExact(csv[19], PeriodFormat, CultureInfo.InvariantCulture)
                     },
                     TitleOfClass = csv[7],
-                    Amount = ParseDecimal(csv[8]),
+                    Amount = ParseOptionalDecimal(csv[8]),
                     AmountType = csv[9],
-                    ReportedValue = ParseDecimal(csv[10]),
+                    ReportedValue = ParseOptionalDecimal(csv[10]),
                     ValueScale = int.Parse(csv[11], NumberStyles.Integer, CultureInfo.InvariantCulture),
                     PutCall = csv[12],
                     InvestmentDiscretion = csv[13],
                     OtherManager = csv[14],
-                    VotingSole = ParseDecimal(csv[15]),
-                    VotingShared = ParseDecimal(csv[16]),
-                    VotingNone = ParseDecimal(csv[17])
+                    VotingSole = ParseOptionalDecimal(csv[15]),
+                    VotingShared = ParseOptionalDecimal(csv[16]),
+                    VotingNone = ParseOptionalDecimal(csv[17])
                 }
             };
         }
@@ -2071,28 +2172,27 @@ namespace QuantConnect.DataProcessing
             var line = row.Line;
             var submission = line.Submission;
 
-            return new StringBuilder()
-                .Append(row.Time.ToStringInvariant(PeriodFormat)).Append(',')
-                .Append(submission.Accession).Append(',')
-                .Append(submission.Cik.ToStringInvariant()).Append(',')
-                .Append(submission.Period.ToStringInvariant(PeriodFormat)).Append(',')
-                .Append(submission.FormType).Append(',')
-                .Append(submission.AmendmentType).Append(',')
-                .Append(submission.AmendmentNumber?.ToStringInvariant() ?? string.Empty).Append(',')
-                .Append(line.TitleOfClass).Append(',')
-                .Append(FormatValue(line.Amount ?? 0m)).Append(',')
-                .Append(line.AmountType).Append(',')
-                .Append(FormatValue(line.ReportedValue ?? 0m)).Append(',')
-                .Append(line.ValueScale.ToStringInvariant()).Append(',')
-                .Append(FormatPutCall(line.PutCall)).Append(',')
-                .Append(line.InvestmentDiscretion).Append(',')
-                .Append(line.OtherManager).Append(',')
-                .Append(FormatValue(line.VotingSole ?? 0m)).Append(',')
-                .Append(FormatValue(line.VotingShared ?? 0m)).Append(',')
-                .Append(FormatValue(line.VotingNone ?? 0m)).Append(',')
-                .Append(submission.ConfidentialOmitted ? '1' : '0').Append(',')
-                .Append(submission.DateReported?.ToStringInvariant(PeriodFormat) ?? string.Empty)
-                .ToString();
+            return string.Join(',',
+                row.Time.ToStringInvariant(PeriodFormat),
+                submission.Accession,
+                submission.Cik.ToStringInvariant(),
+                submission.Period.ToStringInvariant(PeriodFormat),
+                submission.FormType,
+                submission.AmendmentType,
+                submission.AmendmentNumber?.ToStringInvariant(),
+                line.TitleOfClass,
+                FormatValue(line.Amount),
+                line.AmountType,
+                FormatValue(line.ReportedValue),
+                line.ValueScale.ToStringInvariant(),
+                FormatPutCall(line.PutCall),
+                line.InvestmentDiscretion,
+                line.OtherManager,
+                FormatValue(line.VotingSole),
+                FormatValue(line.VotingShared),
+                FormatValue(line.VotingNone),
+                submission.ConfidentialOmitted ? "1" : "0",
+                submission.DateReported?.ToStringInvariant(PeriodFormat));
         }
 
         /// <summary>
@@ -2148,7 +2248,11 @@ namespace QuantConnect.DataProcessing
             Log.Trace($"SEC13FDownloader.LogResolutionSummary(): {_resolvedByCusip} distinct CUSIPs resolved by CUSIP, " +
                       $"{_resolvedByIsin} by constructed ISIN, {_resolvedByTicker} by the N-PORT ticker crosswalk, " +
                       $"{_resolvedByOptionUnderlying} by the security an option is written on, " +
-                      $"{_unresolvedCusips.Count} unresolved, {_malformedCusips} malformed");
+                      $"{_unresolvedCusips.Count} unresolved, {_unresolvedCusips.Count(IsCins)} of them foreign (CINS), " +
+                      $"{_malformedCusips} malformed, " +
+                      $"{_optionSidesInferred} option lines given the side their CUSIP states");
+            Log.Trace($"SEC13FDownloader.LogResolutionSummary(): {_optionLinesByPrice} option lines of multi-issue issuers " +
+                      $"resolved by price, {_optionLinesWithoutOneMatch} dropped for matching no single issue");
             Log.Trace($"SEC13FDownloader.LogResolutionSummary(): {_unresolvedGroups} groups dropped, " +
                       $"{_conflictingTickers} of them, {(totalValue == 0m ? 0m : 100m * _conflictingValue / totalValue).ToStringInvariant("F2")}% " +
                       "of reported value, because the ticker belonged to another security that day, " +
@@ -2158,10 +2262,11 @@ namespace QuantConnect.DataProcessing
                       "number dropped for want of a price matching the close, " +
                       $"{(totalValue == 0m ? 0m : 100m * _mismatchedValue / totalValue).ToStringInvariant("F2")}% of reported value together");
 
+            // The domestic ones are the gaps worth chasing: a foreign issuer LEAN does not list is expected.
             if (_unresolvedCusips.Count > 0)
             {
-                Log.Trace($"SEC13FDownloader.LogResolutionSummary(): unresolved sample: " +
-                          $"{string.Join(", ", _unresolvedCusips.Take(25))}");
+                Log.Trace($"SEC13FDownloader.LogResolutionSummary(): unresolved domestic sample: " +
+                          $"{string.Join(", ", _unresolvedCusips.Where(cusip => !IsCins(cusip)).Take(25))}");
             }
 
             if (_conflictSample.Count > 0)
@@ -2213,18 +2318,30 @@ namespace QuantConnect.DataProcessing
             return parsed;
         }
 
+        /// <summary>Parses a reported amount, where a blank is an absent reading rather than a zero.</summary>
+        private static decimal? ParseOptionalDecimal(string value)
+        {
+            return string.IsNullOrWhiteSpace(value) ? null : ParseDecimal(value);
+        }
+
         /// <summary>True for the "Y" the SEC writes in its flag columns.</summary>
         private static bool IsYes(string value)
         {
             return value.Trim().Equals("Y", StringComparison.OrdinalIgnoreCase);
         }
 
-        /// <summary>Formats an amount: whole numbers without a decimal point, everything else invariant.</summary>
-        private static string FormatValue(decimal value)
+        /// <summary>
+        /// Formats an amount: whole numbers without a decimal point, everything else invariant, and
+        /// a field the filing left empty as empty, since that is not a reported zero.
+        /// </summary>
+        private static string FormatValue(decimal? value)
         {
-            return value == Math.Truncate(value)
-                ? ((long)value).ToStringInvariant()
-                : value.ToStringInvariant();
+            return value switch
+            {
+                null => string.Empty,
+                { } whole when whole == Math.Truncate(whole) => ((long)whole).ToStringInvariant(),
+                _ => value.Value.ToStringInvariant()
+            };
         }
 
         /// <summary>
