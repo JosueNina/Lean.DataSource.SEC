@@ -254,7 +254,7 @@ namespace QuantConnect.DataLibrary.Tests
             var root = Path.Combine(Path.GetTempPath(), $"sec-13f-names-{Guid.NewGuid():N}");
             var folder = Path.Combine(root, "alternative", "sec", "13f");
             Directory.CreateDirectory(folder);
-            File.WriteAllLines(Path.Combine(folder, "managers.csv"), ["1067983,BERKSHIRE HATHAWAY, INC"]);
+            File.WriteAllLines(Path.Combine(folder, "managers.csv"), ["1067983,BERKSHIRE HATHAWAY INC"]);
 
             try
             {
@@ -262,11 +262,46 @@ namespace QuantConnect.DataLibrary.Tests
                 Globals.Reset();
                 SEC13FManagerNameProvider.Reset();
 
-                Assert.AreEqual("BERKSHIRE HATHAWAY, INC", Read(FullLine).ManagerName);
+                Assert.AreEqual("BERKSHIRE HATHAWAY INC", Read(FullLine).ManagerName);
                 Assert.IsNull(Read(FullLine.Replace(",1067983,", ",42,")).ManagerName);
             }
             finally
             {
+                Configuration.Config.Set("data-folder", previous);
+                Globals.Reset();
+                SEC13FManagerNameProvider.Reset();
+                Directory.Delete(root, true);
+            }
+        }
+
+        [Test]
+        public void AMissingManagersFileIsNotTakenForTheDaysAnswer()
+        {
+            // The file is read once a day, since it only gains managers overnight. A read that found
+            // nothing is not that day's answer: stamped as one, a single missed fetch would leave
+            // every name null until midnight.
+            var previous = Globals.DataFolder;
+            var retry = SEC13FManagerNameProvider.RetryInterval;
+            var root = Path.Combine(Path.GetTempPath(), $"sec-13f-names-{Guid.NewGuid():N}");
+            var folder = Path.Combine(root, "alternative", "sec", "13f");
+            Directory.CreateDirectory(folder);
+
+            try
+            {
+                Configuration.Config.Set("data-folder", root);
+                Globals.Reset();
+                SEC13FManagerNameProvider.Reset();
+
+                Assert.IsNull(Read(FullLine).ManagerName, "there is no file yet");
+
+                File.WriteAllLines(Path.Combine(folder, "managers.csv"), ["1067983,BERKSHIRE HATHAWAY INC"]);
+                SEC13FManagerNameProvider.RetryInterval = TimeSpan.Zero;
+
+                Assert.AreEqual("BERKSHIRE HATHAWAY INC", Read(FullLine).ManagerName, "and now there is");
+            }
+            finally
+            {
+                SEC13FManagerNameProvider.RetryInterval = retry;
                 Configuration.Config.Set("data-folder", previous);
                 Globals.Reset();
                 SEC13FManagerNameProvider.Reset();

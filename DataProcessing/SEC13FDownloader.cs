@@ -1,4 +1,4 @@
-﻿/*
+/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
  *
@@ -165,7 +165,7 @@ namespace QuantConnect.DataProcessing
         /// Every filing manager's name by CIK, as the most recent cover page stated it. Published
         /// once in managers.csv rather than on each of the reported positions.
         /// </summary>
-        private readonly Dictionary<int, string> _managerNames = new();
+        private readonly Dictionary<int, (DateTime Filed, string Name)> _managerNames = new();
 
         /// <summary>
         /// Rows waiting to be staged, flushed per archive. Keyed by security, because several CUSIPs
@@ -359,8 +359,11 @@ namespace QuantConnect.DataProcessing
             }
             else
             {
-                // The deployment date, and any recent day whose index EDGAR published late.
-                ProcessEdgarDays(EdgarDaysToRead(_deploymentDate.Value.AddDays(-EdgarLookbackDays), _deploymentDate.Value));
+                // The deployment date, and any recent day whose index EDGAR published late. The
+                // window also reaches back to the day after the last one folded in, or the days a
+                // run missed while EDGAR blocked the job fall out of the lookback and no later run
+                // ever reads them, with every run since reporting success.
+                ProcessEdgarDays(EdgarDaysToRead(FirstDayToCatchUp(_deploymentDate.Value), _deploymentDate.Value));
             }
 
             FinalizeSecurityFiles();
@@ -408,6 +411,22 @@ namespace QuantConnect.DataProcessing
             }
 
             return archives.Where(archive => archive.End < edgarFrom).ToList();
+        }
+
+        /// <summary>
+        /// Where an incremental run starts reading: the lookback, or further back when the last day
+        /// folded in is older than that, so a gap left by an outage is caught up rather than skipped.
+        /// </summary>
+        internal DateTime FirstDayToCatchUp(DateTime deploymentDate)
+        {
+            var lookback = deploymentDate.AddDays(-EdgarLookbackDays);
+            if (_edgarDays.Count == 0)
+            {
+                return lookback;
+            }
+
+            var afterTheLast = _edgarDays.Max.AddDays(1);
+            return afterTheLast < lookback ? afterTheLast : lookback;
         }
 
         /// <summary>
@@ -796,15 +815,19 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
-                // managers.csv is split on its first comma only, so a name keeps its own.
-                var name = fields[columns["FILINGMANAGER_NAME"]].Trim();
+                // No field of managers.csv may carry a comma: the file is split on every one.
+                var name = Sanitize(fields[columns["FILINGMANAGER_NAME"]]);
                 if (name.Length > 0)
                 {
                     submission.ManagerName = name;
 
-                    // The latest name a run sees for a CIK wins, which is the one filed most
-                    // recently, since the archives are read oldest first.
-                    _managerNames[submission.Cik] = name;
+                    // The name of the latest filing wins, rather than of the last row read: neither
+                    // a cover page table nor the order a run reads days in is sorted by filing date,
+                    // so a day whose index came late would otherwise roll the name back.
+                    if (!_managerNames.TryGetValue(submission.Cik, out var known) || known.Filed <= submission.FilingDate)
+                    {
+                        _managerNames[submission.Cik] = (submission.FilingDate, name);
+                    }
                 }
 
                 var amendmentType = Sanitize(fields[columns["AMENDMENTTYPE"]]);
@@ -880,7 +903,7 @@ namespace QuantConnect.DataProcessing
             public decimal? ReportedValue { get; init; }
 
             /// <summary>The power of ten that turns <see cref="ReportedValue"/> into whole dollars.</summary>
-            public int ValueScale { get; init; }
+            public int ValueScale { get; set; }
 
             public string PutCall { get; set; }
             public string InvestmentDiscretion { get; init; }
@@ -1331,7 +1354,11 @@ namespace QuantConnect.DataProcessing
             foreach (var line in holding.Lines)
             {
                 var matches = line.Amount > 0m && line.ReportedValue > 0m
-                    ? candidates.Where(candidate => MatchesClose(line.ReportedValue.Value / line.Amount.Value, candidate.Close.Value)).ToList()
+                    ? candidates
+                        .Select(candidate => (candidate.Security,
+                            Scale: ScaleAgainstClose(line.ReportedValue.Value / line.Amount.Value, candidate.Close.Value)))
+                        .Where(candidate => candidate.Scale != null)
+                        .ToList()
                     : [];
 
                 var ticker = matches.Count == 1 ? ResolveTicker(matches[0].Security, key.FilingDate) : null;
@@ -1342,6 +1369,11 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
+                // The fund and the unit are read off the same close, so the line takes its own
+                // price the way a share line does: it had to take its filing's only for as long as
+                // there was no close to measure it against.
+                line.ValueScale = matches[0].Scale.Value;
+
                 InferOptionSide(key.Cusip, line);
                 _optionLinesByPrice++;
                 _resolvedValue += line.DollarValue;
@@ -1350,11 +1382,22 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>Whether a price is a close, stated in dollars or in thousands, within OptionPriceTolerance.</summary>
-        internal static bool MatchesClose(decimal price, decimal close)
+        internal static bool MatchesClose(decimal price, decimal close) => ScaleAgainstClose(price, close) != null;
+
+        /// <summary>
+        /// The power of ten that turns the value behind <paramref name="price"/> into dollars, when
+        /// that price is the close within OptionPriceTolerance, and null when it is not a close at
+        /// all. Zero for a line in dollars and three for one in thousands.
+        /// </summary>
+        internal static int? ScaleAgainstClose(decimal price, decimal close)
         {
-            var ratio = price / close;
-            return Math.Abs((double)ratio - 1) <= OptionPriceTolerance ||
-                   Math.Abs((double)ratio * 1000 - 1) <= OptionPriceTolerance;
+            var ratio = (double)(price / close);
+            if (Math.Abs(ratio - 1) <= OptionPriceTolerance)
+            {
+                return 0;
+            }
+
+            return Math.Abs(ratio * 1000 - 1) <= OptionPriceTolerance ? 3 : null;
         }
 
         /// <summary>
@@ -2075,13 +2118,15 @@ namespace QuantConnect.DataProcessing
                 }
             }
 
-            foreach (var (cik, name) in _managerNames)
+            foreach (var (cik, manager) in _managerNames)
             {
-                names[cik] = name;
+                names[cik] = manager.Name;
             }
 
+            // Sanitized here and not only where the cover page is read, because the names folded in
+            // come from a file an earlier release wrote, which carried its commas bare.
             File.WriteAllLines(path, names.OrderBy(entry => entry.Key)
-                .Select(entry => $"{entry.Key.ToStringInvariant()},{entry.Value}"));
+                .Select(entry => $"{entry.Key.ToStringInvariant()},{Sanitize(entry.Value)}"));
 
             Log.Trace($"SEC13FDownloader.WriteManagerNames(): {names.Count} managers, " +
                       $"{_managerNames.Count} of them seen this run");

@@ -87,7 +87,7 @@ Each record in a point carries the following fields, exactly as the manager file
 | --- | --- |
 | `AccessionNumber` | EDGAR accession number of the submission the line was reported on |
 | `ManagerCik` | Central Index Key of the filing manager, its stable identity across name changes |
-| `ManagerName` | The manager's name as its most recent cover page states it, null for an unknown CIK |
+| `ManagerName` | The manager's name as its most recent cover page states it, without commas, null for an unknown CIK |
 | `PeriodEnd` | End of the quarter the position is reported for, the SEC PERIODOFREPORT |
 | `FormType` | 13F-HR for a holdings report, 13F-HR/A for an amendment |
 | `AmendmentType` | On an amendment, whether it restates the whole report or only adds holdings |

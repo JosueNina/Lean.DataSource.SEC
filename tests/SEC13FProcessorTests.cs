@@ -35,8 +35,7 @@ namespace QuantConnect.DataLibrary.Tests
     /// The data classes had full coverage while the processor, which is where the subtle logic
     /// lives, had none. Every case below is a defect that actually reached a run and was caught by
     /// hand: a CUSIP left-padded into a different security, a thousand-fold step in the middle of
-    /// the value history, a file written in quarter order that LEAN then silently truncated, and a
-    /// universe that either threw away the finished quarter or resurrected a retired one.
+    /// the value history, and a file written in quarter order that LEAN then silently truncated.
     /// </summary>
     [TestFixture]
     public class SEC13FProcessorTests
@@ -493,9 +492,9 @@ namespace QuantConnect.DataLibrary.Tests
         {
             // The destination arrives empty on every deployment, so a processed-data-directory that
             // is wrong or unmounted leaves an incremental run with nothing to merge into. Publishing
-            // the window on its own would republish thirteen years as three months, rebuild every
-            // universe file from it, and return success: the files come out the right shape, so no
-            // row count tells the two apart. The guard runs before anything is fetched.
+            // the window on its own would republish thirteen years as three months and return
+            // success: the files come out the right shape, so no row count tells the two apart. The
+            // guard runs before anything is fetched.
             using var downloader = new SEC13FDownloader(
                 Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 8));
 
@@ -506,11 +505,11 @@ namespace QuantConnect.DataLibrary.Tests
         [Test]
         public void ARunIntoADestinationAlreadyHoldingFilesFails()
         {
-            // The job hands the destination over empty. Files an earlier run left there would be read
-            // into the universe and published again, so a run refuses to start on top of them.
+            // The job hands the destination over empty. A file an earlier run left there would be
+            // published again, so a run refuses to start on top of one.
             var destination = Path.Combine(_root, "out", SEC13FHolding.ReportFolder);
             Directory.CreateDirectory(destination);
-            File.WriteAllText(Path.Combine(destination, "aapl.csv"), "20240214");
+            File.WriteAllText(Path.Combine(destination, "aapl.zip"), "20240214");
 
             using var downloader = Downloader();
 
@@ -642,7 +641,7 @@ namespace QuantConnect.DataLibrary.Tests
             return shelf;
         }
 
-        // ---- Delisted securities and the universe's shelf life ----------------------------------
+        // ---- Delistings, renames and the tickers that name the files ----------------------------
 
         /// <summary>
         /// Points LEAN's data folder at a map file archive holding exactly the rows given per ticker,
@@ -1142,7 +1141,7 @@ namespace QuantConnect.DataLibrary.Tests
             var row = EntryLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "aapl.zip"), "20260814.csv").Single();
             Assert.AreEqual("20260814,0001214659-26-010148,107136,20260630,13F-HR,RESTATEMENT,1,COM,50,SH,1000,0,P,DFND,1;2,0,50,,1,20260515", row);
 
-            Assert.AreEqual(new[] { "107136,WEALTH ADVISORS, INC." },
+            Assert.AreEqual(new[] { "107136,WEALTH ADVISORS  INC." },
                 File.ReadAllLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv")));
         }
 
@@ -1192,6 +1191,30 @@ namespace QuantConnect.DataLibrary.Tests
             Assert.AreEqual("C", emerging[12], "the side comes from the CUSIP");
         }
 
+        [Test]
+        public void AnOptionLineTakesTheUnitItsCloseProves()
+        {
+            // The filing has no share line, so its own unit is only the SEC rule for its date, which
+            // after 2023 says dollars. The close the line was matched on says thousands, and it is
+            // the one reading here that looked at a price: published in dollars the value would be
+            // a thousandfold short.
+            var iwm = SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), "IWM", Market.USA);
+            var eem = SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), "EEM", Market.USA);
+            SeedMapFiles("iwm", "eem");
+            SeedSecurityDatabase(
+                $"{iwm},46428765,BBG000CGC9C4,2622059,US4642876555,1100663",
+                $"{eem},46428723,BBG000M0P5L2,2801669,US4642872349,1100663");
+            SeedCoarse("20260630", (iwm, 220m), (eem, 45m));
+
+            var day = new DateTime(2026, 8, 14);
+            var filing = OptionFiling(day);
+            filing.Lines.Add(["464287905", "RUSSELL 2000 ETF", "22", "100", "SH", "Call", "SOLE", null, "0", "0", "100"]);
+
+            var row = PublishedRows(day, filing, "iwm").Single().Split(',');
+            Assert.AreEqual("22", row[10], "the manager's number is published untouched");
+            Assert.AreEqual("3", row[11]);
+        }
+
         [TestCase(220, 220, true)]
         [TestCase(221, 220, true)]
         [TestCase(224, 220, false)]
@@ -1201,6 +1224,121 @@ namespace QuantConnect.DataLibrary.Tests
         public void AnOptionLineNamesAFundOnlyWithinHalfAPercentOfItsClose(double price, double close, bool expected)
         {
             Assert.AreEqual(expected, SEC13FDownloader.MatchesClose((decimal)price, (decimal)close));
+        }
+
+        [TestCase("20260903", "20260830", TestName = "the lookback reaches further than the last day folded in")]
+        [TestCase("20260908", "20260830", TestName = "the last day folded in is inside the lookback")]
+        public void AnIncrementalRunStartsAtTheLookback(string lastFolded, string expected)
+        {
+            var shelf = PublishedShelf();
+            File.WriteAllLines(Path.Combine(shelf, "edgar-days.txt"), ["#from 20260601", lastFolded]);
+
+            using var downloader = new SEC13FDownloader(
+                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 9));
+            downloader.ReadEdgarState();
+
+            Assert.AreEqual(expected, downloader.FirstDayToCatchUp(new DateTime(2026, 9, 9)).ToString("yyyyMMdd"));
+        }
+
+        [Test]
+        public void AManagerKeepsTheNameOfItsLatestFilingWhateverOrderTheDaysAreRead()
+        {
+            // A day whose index came late is read after newer ones, so the last name a run sees is
+            // not the most recently filed. Taking it would roll the published name back to an older
+            // one until the manager files again.
+            SeedMapFiles("aapl");
+            using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                null, Path.Combine(_root, "raw"));
+            downloader.TickerCrosswalk = UnitTestCrosswalk();
+
+            ProcessEdgarDay(downloader, new DateTime(2026, 8, 14), NamedFiling(new DateTime(2026, 8, 14), "NEWCO ASSET MGMT"));
+            ProcessEdgarDay(downloader, new DateTime(2026, 8, 10), NamedFiling(new DateTime(2026, 8, 10), "OLDCO ASSET MGMT"));
+            downloader.FinalizeSecurityFiles();
+
+            Assert.AreEqual(new[] { "7,NEWCO ASSET MGMT" },
+                File.ReadAllLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv")));
+        }
+
+        /// <summary>One filing of CIK 7 on a day, holding a line that resolves, under the name given.</summary>
+        private static SEC13FEdgarDay.Filing NamedFiling(DateTime day, string name)
+        {
+            var filing = new SEC13FEdgarDay.Filing
+            {
+                Accession = $"0000000007-26-{day:MMdd}01", SubmissionType = "13F-HR", Cik = 7, Filed = day,
+                Period = new DateTime(2026, 6, 30), ManagerName = name
+            };
+
+            filing.Lines.Add(["037833100", "COM", "1000", "50", "SH", null, "SOLE", null, "50", "0", "0"]);
+            return filing;
+        }
+
+        [Test]
+        public void AnIncrementalRunReachesBackToTheDaysAnOutageMissed()
+        {
+            // EDGAR blocked the runner for a fortnight, so every run in between failed. Reading only
+            // the ten day lookback would step over the days in the gap and return success, and no
+            // later run would ever reach them.
+            var shelf = PublishedShelf();
+            File.WriteAllLines(Path.Combine(shelf, "edgar-days.txt"), ["#from 20260601", "20260814"]);
+
+            using var downloader = new SEC13FDownloader(
+                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 9));
+            downloader.ReadEdgarState();
+
+            var days = downloader.EdgarDaysToRead(
+                downloader.FirstDayToCatchUp(new DateTime(2026, 9, 9)), new DateTime(2026, 9, 9));
+
+            Assert.AreEqual("20260817", days[0].ToString("yyyyMMdd"), "the day after the last one folded in");
+            Assert.AreEqual("20260909", days[^1].ToString("yyyyMMdd"));
+            Assert.IsFalse(days.Contains(new DateTime(2026, 8, 14)), "a day already folded in is not read again");
+        }
+
+        [Test]
+        public void TheFilingNamesItsOwnFilerRatherThanTheIndex()
+        {
+            // The index lists an accession once per CIK it names, and the first line of it can be a
+            // co-filer, so the daily path would file the positions under the wrong manager and split
+            // its history from what the data sets published.
+            var filing = SEC13FEdgarDay.ParseFiling(
+                new SECEdgarIndex.Entry("13F-HR", 50, new DateTime(2026, 8, 14), "edgar/data/50/x.txt"),
+                SampleSubmission().Replace("<filerInfo>",
+                    "<filerInfo><filer><credentials><cik>0000000100</cik></credentials></filer>"));
+
+            Assert.AreEqual(100, filing.Cik);
+        }
+
+        [Test]
+        public void AFilingWithNoCredentialsKeepsTheIndexCik()
+        {
+            Assert.AreEqual(107136, SEC13FEdgarDay.ParseFiling(SampleEntry(), SampleSubmission()).Cik);
+        }
+
+        [Test]
+        public void ANamePublishedWithItsCommaIsCleanedWhenItIsFoldedIn()
+        {
+            // An earlier release wrote the names with their commas, so the file on the shelf carries
+            // lines of three fields. A run that folded them in untouched would republish them, and a
+            // manager that does not file again would keep its broken line for good.
+            SeedMapFiles("aapl");
+            var shelf = PublishedShelf();
+            SeedPublishedZip(shelf, "aapl", "20240215");
+            File.WriteAllLines(Path.Combine(shelf, "managers.csv"), ["2230,ADAMS DIVERSIFIED EQUITY FUND, INC."]);
+
+            var day = new DateTime(2026, 8, 14);
+            using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                day, Path.Combine(_root, "raw"));
+            downloader.TickerCrosswalk = UnitTestCrosswalk();
+
+            ProcessEdgarDay(downloader, day);
+            downloader.FinalizeSecurityFiles();
+
+            var published = File.ReadAllLines(
+                Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv"));
+
+            Assert.IsTrue(published.Contains("2230,ADAMS DIVERSIFIED EQUITY FUND  INC."),
+                $"the folded in name reads as {published.FirstOrDefault(line => line.StartsWith("2230,"))}");
+            Assert.IsEmpty(published.Where(line => line.Count(character => character == ',') != 1).ToList(),
+                "a folded in name still carries a separator");
         }
 
         [Test]
@@ -1507,7 +1645,7 @@ namespace QuantConnect.DataLibrary.Tests
         /// Points LEAN's data folder at a map file archive this test wrote, holding one row per
         /// ticker that spans every date used here.
         ///
-        /// The universe build turns each ticker into a SecurityIdentifier point in time, and
+        /// Publication turns each ticker into a SecurityIdentifier point in time, and
         /// LocalZipMapFileProvider throws outright when it finds no archive at all, so without this
         /// the test could only be skipped on a machine with no LEAN data checkout, which is most of
         /// them. The lookup date is pinned rather than left to walk back from yesterday, so the

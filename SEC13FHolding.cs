@@ -68,8 +68,9 @@ namespace QuantConnect.DataSource
         public int ManagerCik { get; set; }
 
         /// <summary>
-        /// Name of the manager as its most recent cover page states it, read from managers.csv.
-        /// It is the current name even on an old filing, and null for a CIK the file does not carry.
+        /// Name of the manager as its most recent cover page states it, read from managers.csv, with
+        /// any comma taken out because that file is split on every one. It is the current name even
+        /// on an old filing, and null for a CIK the file does not carry.
         /// </summary>
         public string ManagerName { get; set; }
 

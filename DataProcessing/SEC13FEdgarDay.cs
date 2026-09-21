@@ -159,7 +159,11 @@ namespace QuantConnect.DataProcessing
             {
                 Accession = entry.Accession,
                 SubmissionType = entry.FormType,
-                Cik = entry.Cik,
+
+                // The filing names its own filer. The index lists an accession once per CIK it
+                // names, so the first line of it can be a co-filer whose name sorts earlier, and
+                // the data sets take the CIK from the filing: the two paths have to agree.
+                Cik = FilerCik(primary) ?? entry.Cik,
                 Filed = entry.Filed,
                 Period = DateTime.ParseExact(period, XmlDateFormat, CultureInfo.InvariantCulture),
                 ConfidentialOmitted = IsTrue(Value(primary, "isConfidentialOmitted")),
@@ -192,6 +196,21 @@ namespace QuantConnect.DataProcessing
             }
 
             return filing;
+        }
+
+        /// <summary>
+        /// The filer's CIK as the primary document states it, or null when it carries none. Scoped to
+        /// the credentials of the filer info, which is the only place that element appears: a search
+        /// of the whole document would also reach the CIKs of the other managers on the cover page.
+        /// </summary>
+        private static int? FilerCik(XElement primary)
+        {
+            var credentials = SECEdgarIndex.Elements(primary, "credentials").FirstOrDefault();
+            return credentials != null &&
+                   int.TryParse(SECEdgarIndex.Value(credentials, "cik"), NumberStyles.Integer,
+                       CultureInfo.InvariantCulture, out var cik)
+                ? cik
+                : null;
         }
 
         /// <summary>Writes the four tables the processor reads, in the data sets' layout.</summary>

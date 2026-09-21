@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
 using QuantConnect.Interfaces;
+using QuantConnect.Logging;
 using QuantConnect.Util;
 
 namespace QuantConnect.DataSource
@@ -31,22 +32,36 @@ namespace QuantConnect.DataSource
     {
         private const string FileName = "managers.csv";
 
+        /// <summary>How long a read that found no file waits before trying again.</summary>
+        internal static TimeSpan RetryInterval = TimeSpan.FromMinutes(5);
+
         private static readonly object _lock = new();
         private static Dictionary<int, string> _names;
         private static DateTime _loaded;
+        private static DateTime _attempted;
 
         /// <summary>The manager's name, or null for a CIK the file does not carry.</summary>
         public static string GetName(int managerCik)
         {
             lock (_lock)
             {
-                // Read again when the day changes, since the file gains the managers that filed
-                // for the first time each night.
-                var today = DateTime.UtcNow.Date;
-                if (_names == null || _loaded != today)
+                // Read again when the day changes, since the file gains the managers that filed for
+                // the first time each night. A read that found no file is not an answer: stamping
+                // the day for it would leave every name null until midnight over one missed fetch.
+                // It is retried, but not on every line, since a data folder that simply does not
+                // carry the file would otherwise never stop asking for it.
+                var now = DateTime.UtcNow;
+                if (_names == null || (_loaded != now.Date && now - _attempted >= RetryInterval))
                 {
-                    _names = Read();
-                    _loaded = today;
+                    _attempted = now;
+                    var read = Read();
+                    if (read != null)
+                    {
+                        _names = read;
+                        _loaded = now.Date;
+                    }
+
+                    _names ??= [];
                 }
 
                 return _names.GetValueOrDefault(managerCik);
@@ -59,12 +74,13 @@ namespace QuantConnect.DataSource
             lock (_lock)
             {
                 _names = null;
+                _attempted = default;
             }
         }
 
+        /// <summary>The names in the file, or null when there is no file to read.</summary>
         private static Dictionary<int, string> Read()
         {
-            Dictionary<int, string> names = [];
             var path = Path.Combine(Globals.DataFolder, "alternative", "sec", SEC13FHolding.ReportFolder, FileName);
 
             // Through the data provider where there is one, so the cloud fetches the file.
@@ -72,13 +88,14 @@ namespace QuantConnect.DataSource
                 ?? (File.Exists(path) ? File.OpenRead(path) : null);
             if (stream == null)
             {
-                return names;
+                Log.Trace($"SEC13FManagerNameProvider.Read(): no {FileName} at {path}, so every ManagerName is null");
+                return null;
             }
 
+            Dictionary<int, string> names = [];
             using var reader = new StreamReader(stream);
             while (reader.ReadLine() is { } line)
             {
-                // Only the first comma separates: a name may carry its own.
                 var separator = line.IndexOf(',');
                 if (separator > 0 && int.TryParse(line.AsSpan(0, separator), NumberStyles.Integer, CultureInfo.InvariantCulture, out var cik))
                 {
