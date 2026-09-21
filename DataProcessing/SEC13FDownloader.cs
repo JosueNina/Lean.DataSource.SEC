@@ -115,6 +115,9 @@ namespace QuantConnect.DataProcessing
         /// <summary>Where the manager's CIK sits in a published row, which is read back by column.</summary>
         private const int ManagerCikColumn = 2;
 
+        /// <summary>Where the accession sits in a published row, which names the filing its line came from.</summary>
+        private const int AccessionColumn = 1;
+
         // N-PORT quarters folded into the crosswalk: a year reaches every security still trading.
         private const int NPortQuartersToFold = 4;
 
@@ -799,7 +802,15 @@ namespace QuantConnect.DataProcessing
                 {
                     Accession = accession,
                     Cik = int.Parse(fields[columns["CIK"]], NumberStyles.Integer, CultureInfo.InvariantCulture),
-                    FilingDate = ParseSecDate(fields[columns["FILING_DATE"]], archive, "FILING_DATE"),
+                    // A daily index can name a filing whose own date is an earlier day: one 13F-HR
+                    // across the 2026 Q2 and Q3 indexes, filed 2026-04-27 and listed on 04-28. The
+                    // row carries the day it was listed, which is the first day the job could have
+                    // it, so nothing reads in a backtest before it was public. The cost is that a
+                    // rebuild reads that accession from the data sets, which state 04-27, and
+                    // republishes the row a day earlier.
+                    FilingDate = archive.IsDaily
+                        ? archive.End
+                        : ParseSecDate(fields[columns["FILING_DATE"]], archive, "FILING_DATE"),
                     Period = ParseSecDate(fields[columns["PERIODOFREPORT"]], archive, "PERIODOFREPORT"),
                     FormType = submissionType.Trim()
                 };
@@ -913,8 +924,12 @@ namespace QuantConnect.DataProcessing
         /// </summary>
         private static string Sanitize(string value)
         {
-            return value.Trim().Replace(',', ' ').Replace('"', ' ').Trim();
+            // The runs of whitespace the replacements leave are collapsed, or a name written
+            // "Pershing Square Capital Management, L.P." would be published with two spaces.
+            return Whitespace.Replace(value.Replace(',', ' ').Replace('"', ' '), " ").Trim();
         }
+
+        private static readonly Regex Whitespace = new(@"\s+", RegexOptions.Compiled);
 
         private static readonly Regex OtherManagerSeparator = new(@"[,;\s]+", RegexOptions.Compiled);
 
@@ -2106,15 +2121,36 @@ namespace QuantConnect.DataProcessing
                 {
                     var name = $"{day.Key.ToStringInvariant(PeriodFormat)}.csv";
 
-                    // A date read again is rewritten rather than appended to: the archive carries
-                    // every filing of that day, so the fresh read is the whole of it.
-                    if (updating)
+                    // A date already published is added to, never replaced. What is published for it
+                    // can come from filings this read does not carry: the daily index and the
+                    // quarterly data sets do not name the same filings for a day, and an index can
+                    // name a filing dated an earlier day. Taking the read for the whole of the date
+                    // dropped every other manager's positions of it, and reported success. Only the
+                    // lines of the filings being written are dropped, so a filing read twice is
+                    // published once.
+                    var kept = Array.Empty<string>();
+                    var existing = updating ? zip.GetEntry(name) : null;
+                    if (existing != null)
                     {
-                        zip.GetEntry(name)?.Delete();
+                        var rewritten = day.Select(row => row.Line.Submission.Accession).ToHashSet(StringComparer.Ordinal);
+                        using (var reader = new StreamReader(existing.Open()))
+                        {
+                            kept = reader.ReadToEnd()
+                                .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                                .Where(line => !rewritten.Contains(AccessionOf(line)))
+                                .ToArray();
+                        }
+
+                        existing.Delete();
                     }
 
                     // The same bytes whichever system the job runs on.
                     using var writer = new StreamWriter(zip.CreateEntry(name, CompressionLevel.Optimal).Open()) { NewLine = "\n" };
+                    foreach (var line in kept)
+                    {
+                        writer.WriteLine(line);
+                    }
+
                     foreach (var row in day)
                     {
                         writer.WriteLine(FormatRow(row));
@@ -2236,6 +2272,13 @@ namespace QuantConnect.DataProcessing
             Log.Trace($"SEC13FDownloader.ManagersPublishedAfter(): {managers.Count} managers already published a " +
                       $"filing in the {entries.Count} days after {after:yyyy-MM-dd}, read from {read} entries");
             return managers;
+        }
+
+        /// <summary>The accession of a published row, or empty for a line too short to carry one.</summary>
+        private static string AccessionOf(string line)
+        {
+            var fields = line.Split(',');
+            return fields.Length > AccessionColumn ? fields[AccessionColumn] : string.Empty;
         }
 
         /// <summary>One published row: a single reported position, on the date it was filed.</summary>
@@ -2490,7 +2533,9 @@ namespace QuantConnect.DataProcessing
             return value switch
             {
                 null => string.Empty,
-                { } whole when whole == Math.Truncate(whole) => ((long)whole).ToStringInvariant(),
+                // Formatted rather than cast: filers type nonsense into VALUE, and a decimal above
+                // long.MaxValue threw out of the cast and stopped the run over one bad line.
+                { } whole when whole == Math.Truncate(whole) => whole.ToString("0", CultureInfo.InvariantCulture),
                 _ => value.Value.ToStringInvariant()
             };
         }

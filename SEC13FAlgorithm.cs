@@ -48,6 +48,9 @@ namespace QuantConnect.DataLibrary.Tests
         /// <summary>The shares the manager reported for each equity, by the quarter they describe.</summary>
         private readonly Dictionary<Symbol, SortedDictionary<DateTime, decimal>> _sharesByEquity = [];
 
+        /// <summary>The newest quarter the managers have reported, for any name.</summary>
+        private DateTime _latestPeriod;
+
         private bool _rebalance;
 
         /// <summary>
@@ -89,6 +92,7 @@ namespace QuantConnect.DataLibrary.Tests
                 {
                     var shares = _sharesByEquity[equity];
                     shares[holding.PeriodEnd] = shares.GetValueOrDefault(holding.PeriodEnd) + (holding.Amount ?? 0);
+                    _latestPeriod = holding.PeriodEnd > _latestPeriod ? holding.PeriodEnd : _latestPeriod;
                     _rebalance = true;
 
                     Log($"{Time:yyyy-MM-dd} {equity.Value} - {holding.ManagerName} reports {holding.Amount:N0} shares, " +
@@ -109,19 +113,21 @@ namespace QuantConnect.DataLibrary.Tests
             foreach (var (equity, shares) in _sharesByEquity.Where(kvp => kvp.Value.Count > 1))
             {
                 var (previous, latest) = (shares.Values.ElementAt(shares.Count - 2), shares.Values.Last());
-                Log($"{Time:yyyy-MM-dd} {equity.Value}: {previous:N0} -> {latest:N0} shares ({latest / previous - 1:+0.0%;-0.0%}) " +
+
+                // A quarter the manager opened the position in reports no shares before it.
+                var change = previous > 0 ? $" ({latest / previous - 1:+0.0%;-0.0%})" : string.Empty;
+                Log($"{Time:yyyy-MM-dd} {equity.Value}: {previous:N0} -> {latest:N0} shares{change} " +
                     $"between {shares.Keys.ElementAt(shares.Count - 2):yyyy-MM-dd} and {shares.Keys.Last():yyyy-MM-dd}");
             }
 
             // With one quarter known, hold what the manager holds. With two, hold what it added to.
             var selected = _sharesByEquity
-                .Where(kvp => kvp.Value.Count > 0)
-                .Where(kvp =>
-                {
-                    var quarters = kvp.Value.Values.ToList();
-                    return quarters.Count == 1 ? quarters[0] > 0 : quarters[^1] > quarters[^2];
-                })
-                .Select(kvp => kvp.Key)
+                .Select(kvp => (Equity: kvp.Key, Quarters: QuartersOf(kvp.Value)))
+                .Where(entry => entry.Quarters.Count > 0)
+                .Where(entry => entry.Quarters.Count == 1
+                    ? entry.Quarters[0] > 0
+                    : entry.Quarters[^1] > entry.Quarters[^2])
+                .Select(entry => entry.Equity)
                 .ToList();
 
             if (selected.Count == 0)
@@ -133,6 +139,24 @@ namespace QuantConnect.DataLibrary.Tests
             Log($"{Time:yyyy-MM-dd} holding {string.Join(", ", selected.Select(symbol => symbol.Value))}");
             SetHoldings(selected.Select(symbol => new PortfolioTarget(symbol, 1m / selected.Count)).ToList(),
                 liquidateExistingHoldings: true);
+        }
+
+        /// <summary>
+        /// The shares reported for one equity, oldest quarter first, with a closing zero for a name
+        /// the manager has stopped reporting. A position sold out of has no line in the new quarter,
+        /// so its newest period stays behind the newest the manager reported anywhere; taken for the
+        /// name's own latest quarter, it would go on being compared with the quarter before it and
+        /// held forever. Not being reported is a report of no shares.
+        /// </summary>
+        private List<decimal> QuartersOf(SortedDictionary<DateTime, decimal> shares)
+        {
+            var quarters = shares.Values.ToList();
+            if (shares.Count > 0 && shares.Keys.Last() < _latestPeriod)
+            {
+                quarters.Add(0m);
+            }
+
+            return quarters;
         }
 
         /// <summary>

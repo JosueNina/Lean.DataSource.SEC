@@ -72,6 +72,14 @@ namespace QuantConnect.DataProcessing
 
         private const string XmlDateFormat = "MM-dd-yyyy";
 
+        /// <summary>
+        /// The share of a day's filings that may be unreadable before the day fails. A filing the SEC
+        /// accepted and this reader cannot is skipped, since failing the day over it would stop the
+        /// data set for good; a whole day of them is a layout change and must still throw. One filing
+        /// is always allowed, so a quiet day of three does not fail over its one bad one.
+        /// </summary>
+        private const double MaxUnreadableShare = 0.05;
+
         /// <summary>The name a day's archive is cached and logged under.</summary>
         public static string ArchiveName(DateTime day) => $"edgar-{day.ToString(DateFormat.EightCharacter, CultureInfo.InvariantCulture)}_form13f.zip";
 
@@ -117,9 +125,33 @@ namespace QuantConnect.DataProcessing
             }
 
             var filings = new List<Filing>(entries.Count);
+            var unreadable = 0;
             foreach (var entry in entries)
             {
-                filings.Add(ParseFiling(entry, getText(SECEdgarIndex.ArchivesBaseUrl + entry.Path)));
+                try
+                {
+                    filings.Add(ParseFiling(entry, getText(SECEdgarIndex.ArchivesBaseUrl + entry.Path)));
+                }
+                catch (Exception error) when (error is InvalidDataException or FormatException)
+                {
+                    // One filing the SEC accepted and this reader cannot is not worth the data set
+                    // for: thrown, it fails the day, the day is never recorded, and every run after
+                    // it meets the same filing and fails again until someone ships code. An
+                    // HttpRequestException is not caught, so a network failure still fails the day
+                    // and the day is read again.
+                    Log.Error($"SEC13FEdgarDay.Build(): {day:yyyy-MM-dd} {entry.Accession} cannot be read, " +
+                              $"skipping it: {error.Message}");
+                    unreadable++;
+                }
+            }
+
+            // A layout change reads as filing after filing being unreadable, and that has to fail
+            // loudly rather than publish a day emptied of most of what it held.
+            if (unreadable > Math.Max(1, entries.Count * MaxUnreadableShare))
+            {
+                throw new InvalidDataException(
+                    $"SEC13FEdgarDay.Build(): {day:yyyy-MM-dd}: {unreadable} of {entries.Count} filings could not be " +
+                    "read, which is more than a bad filing or two. The layout of the primary document has likely changed.");
             }
 
             Directory.CreateDirectory(directory);

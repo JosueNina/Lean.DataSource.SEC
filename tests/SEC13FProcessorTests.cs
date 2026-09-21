@@ -1141,7 +1141,8 @@ namespace QuantConnect.DataLibrary.Tests
             var row = EntryLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "aapl.zip"), "20260814.csv").Single();
             Assert.AreEqual("20260814,0001214659-26-010148,107136,20260630,13F-HR,RESTATEMENT,1,COM,50,SH,1000,0,P,DFND,1;2,0,50,,1,20260515", row);
 
-            Assert.AreEqual(new[] { "107136,WEALTH ADVISORS  INC." },
+            // The comma the name carries comes out as one space, not the two the replacement leaves.
+            Assert.AreEqual(new[] { "107136,WEALTH ADVISORS INC." },
                 File.ReadAllLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv")));
         }
 
@@ -1164,6 +1165,24 @@ namespace QuantConnect.DataLibrary.Tests
 
             Assert.AreEqual(new[] { "C", "P", "C" }, rows.Select(row => row.Split(',')[12]).ToArray(),
                 "a side the line states is kept");
+        }
+
+        [TestCase("1000", "1000", TestName = "a whole value is published without a decimal point")]
+        [TestCase("1000.50", "1000.50", TestName = "a value with cents keeps them")]
+        [TestCase("99999999999999999999", "99999999999999999999", TestName = "a value past long.MaxValue is published, not thrown on")]
+        public void AValueIsPublishedAsTheFilerWroteIt(string filed, string published)
+        {
+            // Filers type nonsense into VALUE. Cast to a long, a number past its range threw out of
+            // the formatter and stopped the run over one line.
+            var apple = SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), "AAPL", Market.USA);
+            SeedMapFileRows(("aapl", new[] { "19801212,aapl", "20501231,aapl" }));
+            SeedSecurityDatabase($"{apple},03783310,BBG000B9XRY4,2046251,US0378331005,320193");
+
+            var day = new DateTime(2026, 8, 14);
+            var filing = OptionFiling(day);
+            filing.Lines.Add(["037833100", "COM", filed, "50", "SH", null, "SOLE", null, "50", "0", "0"]);
+
+            Assert.AreEqual(published, PublishedRows(day, filing, "aapl").Single().Split(',')[10]);
         }
 
         [Test]
@@ -1521,6 +1540,40 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
+        public void AFilingThatCannotBeReadIsSkippedRatherThanFailingTheDay()
+        {
+            // Thrown, one bad filing fails the day, the day is never recorded, and every run after
+            // it meets the same filing: the data set stops until someone ships code.
+            var built = BuildDayOfThree(unreadable: 1);
+
+            Assert.IsNotNull(built.Path);
+            Assert.AreEqual(2, built.Filings);
+        }
+
+        [Test]
+        public void ADayOfFilingsThatCannotBeReadStillThrows()
+        {
+            // Filing after filing unreadable is a layout change, not a bad filer, and publishing the
+            // day emptied of what it held would be worse than failing.
+            Assert.Throws<InvalidDataException>(() => BuildDayOfThree(unreadable: 3));
+        }
+
+        /// <summary>One EDGAR day of three filings, the first <paramref name="unreadable"/> of them broken.</summary>
+        private SEC13FEdgarDay.Built BuildDayOfThree(int unreadable)
+        {
+            var day = new DateTime(2026, 8, 14);
+            var index = string.Join('\n', Enumerable.Range(1, 3).Select(filing =>
+                $"13F-HR   SOME MANAGER LP   {filing}   20260814   edgar/data/{filing}/0000000000-26-00000{filing}.txt"));
+
+            var broken = 0;
+            return SEC13FEdgarDay.Build(day, Path.Combine(_root, "day-of-three"),
+                _ => new HashSet<string> { "2026", "QTR3", "form.20260814.idx" },
+                url => url.EndsWith(".idx", StringComparison.Ordinal)
+                    ? index
+                    : ++broken <= unreadable ? "<SEC-DOCUMENT>no primary document here</SEC-DOCUMENT>" : SampleSubmission());
+        }
+
+        [Test]
         public void ANamePublishedWithItsCommaIsCleanedWhenItIsFoldedIn()
         {
             // An earlier release wrote the names with their commas, so the file on the shelf carries
@@ -1542,7 +1595,7 @@ namespace QuantConnect.DataLibrary.Tests
             var published = File.ReadAllLines(
                 Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv"));
 
-            Assert.IsTrue(published.Contains("2230,ADAMS DIVERSIFIED EQUITY FUND  INC."),
+            Assert.IsTrue(published.Contains("2230,ADAMS DIVERSIFIED EQUITY FUND INC."),
                 $"the folded in name reads as {published.FirstOrDefault(line => line.StartsWith("2230,"))}");
             Assert.IsEmpty(published.Where(line => line.Count(character => character == ',') != 1).ToList(),
                 "a folded in name still carries a separator");
@@ -1568,6 +1621,91 @@ namespace QuantConnect.DataLibrary.Tests
             using var zip = ZipFile.OpenRead(Path.Combine(destination, "aapl.zip"));
             Assert.AreEqual(new[] { "20240215.csv", "20260814.csv" }, zip.Entries.Select(entry => entry.Name).OrderBy(name => name).ToArray());
             Assert.IsFalse(File.Exists(Path.Combine(destination, "aapl.csv")), "the date index is gone");
+        }
+
+        [Test]
+        public void AnIncrementalRunKeepsThePublishedRowsOfADateItWritesInto()
+        {
+            // A date the run has rows for is not the run's to rewrite: what is published for it can
+            // come from a filing this read does not carry, since the daily index and the quarterly
+            // data sets do not list the same filings for a day. Replacing the entry with this run's
+            // rows drops every other manager's positions of that date, and the run reports success.
+            SeedMapFiles("aapl");
+            var day = new DateTime(2026, 8, 13);
+            SeedPublishedEntry(PublishedShelf(), "aapl", "20260813",
+                "0000000001-26-000001", "0000000002-26-000002");
+
+            PublishEdgarDay(day, NamedFiling(day, "NEWCO ASSET MGMT"));
+
+            var accessions = PublishedEntryLines("aapl", "20260813.csv").Select(line => line.Split(',')[1]).OrderBy(x => x).ToArray();
+            Assert.AreEqual(
+                new[] { "0000000001-26-000001", "0000000002-26-000002", "0000000007-26-081301" }, accessions,
+                "the two published rows and the new one");
+        }
+
+        [Test]
+        public void AFilingReadTwiceIsNotPublishedTwice()
+        {
+            // The same filing read again replaces its own lines rather than adding a second copy, so
+            // a day re-read after a publish that failed half way is still idempotent.
+            SeedMapFiles("aapl");
+            var day = new DateTime(2026, 8, 13);
+            SeedPublishedEntry(PublishedShelf(), "aapl", "20260813",
+                "0000000001-26-000001", "0000000007-26-081301");
+
+            PublishEdgarDay(day, NamedFiling(day, "NEWCO ASSET MGMT"));
+
+            var accessions = PublishedEntryLines("aapl", "20260813.csv").Select(line => line.Split(',')[1]).ToArray();
+            Assert.AreEqual(2, accessions.Length);
+            Assert.AreEqual(1, accessions.Count(accession => accession == "0000000007-26-081301"), "one copy");
+        }
+
+        [Test]
+        public void ADailyArchiveStampsItsRowsWithTheDayItWasRead()
+        {
+            // An EDGAR daily index can list a filing whose own date is an earlier day: one 13F-HR in
+            // the 2026 Q2 and Q3 indexes, 2026-04-27 listed on 04-28. The row carries the day the job
+            // could have it, which is the day the index named it, so nothing is visible in a backtest
+            // before it was public. A later rebuild reads that accession from the data sets and
+            // publishes it under its own filing date, so the row moves by a day.
+            SeedMapFiles("aapl");
+            var day = new DateTime(2026, 4, 28);
+
+            PublishEdgarDay(day, NamedFiling(new DateTime(2026, 4, 27), "BACKDATED ASSET MGMT"));
+
+            using var zip = ZipFile.OpenRead(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "aapl.zip"));
+            Assert.AreEqual(new[] { "20260428.csv" }, zip.Entries.Select(entry => entry.Name).ToArray());
+            Assert.AreEqual("20260428", PublishedEntryLines("aapl", "20260428.csv").Single().Split(',')[0]);
+        }
+
+        /// <summary>An incremental run over one EDGAR day, published into the destination.</summary>
+        private void PublishEdgarDay(DateTime day, SEC13FEdgarDay.Filing filing)
+        {
+            using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                day, Path.Combine(_root, "raw"));
+            downloader.TickerCrosswalk = UnitTestCrosswalk();
+
+            ProcessEdgarDay(downloader, day, filing);
+            downloader.FinalizeSecurityFiles();
+        }
+
+        /// <summary>The lines of one published entry of a ticker's zip in the destination.</summary>
+        private string[] PublishedEntryLines(string ticker, string entry)
+        {
+            using var zip = ZipFile.OpenRead(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, $"{ticker}.zip"));
+            using var reader = new StreamReader(zip.GetEntry(entry).Open());
+            return reader.ReadToEnd().Split('\n', StringSplitOptions.RemoveEmptyEntries);
+        }
+
+        /// <summary>A published zip whose entry for one date holds a row of each accession given.</summary>
+        private static void SeedPublishedEntry(string shelf, string ticker, string date, params string[] accessions)
+        {
+            using var zip = ZipFile.Open(Path.Combine(shelf, $"{ticker}.zip"), ZipArchiveMode.Create);
+            using var writer = new StreamWriter(zip.CreateEntry($"{date}.csv").Open()) { NewLine = "\n" };
+            foreach (var accession in accessions)
+            {
+                writer.WriteLine($"{date},{accession},1,20260630,13F-HR,,,COM,1,SH,1,0,,SOLE,,1,0,0,0,");
+            }
         }
 
         [Test]

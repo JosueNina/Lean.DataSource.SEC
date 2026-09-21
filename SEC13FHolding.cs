@@ -240,10 +240,11 @@ namespace QuantConnect.DataSource
         {
             var csv = line.Split(',');
 
-            // A truncated line is skipped rather than thrown on: an exception out of Reader ends
-            // the algorithm. The test is "fewer than" and not "not equal to", so a column appended
-            // in a later revision of the file leaves every existing one readable instead of muting
-            // the whole dataset.
+            // A truncated line is skipped rather than thrown on: LEAN takes an exception out of
+            // Reader as a reader error and drops the line, so throwing would turn a silent skip
+            // into a logged one and nothing more. The test is "fewer than" and not "not equal to",
+            // so a column appended in a later revision of the file leaves every existing one
+            // readable instead of muting the whole dataset.
             if (csv.Length < ExpectedColumns)
             {
                 return null;

@@ -42,6 +42,9 @@ class SEC13FAlgorithm(QCAlgorithm):
         # The shares the manager reported for each equity, by the quarter they describe.
         self._shares_by_equity = {}
 
+        # The newest quarter the managers have reported, for any name.
+        self._latest_period = datetime.min
+
         self._rebalance = False
 
         for ticker in ["META", "UBER", "QSR", "MSFT", "BN", "HTZ", "AMZN"]:
@@ -64,6 +67,7 @@ class SEC13FAlgorithm(QCAlgorithm):
 
                 shares = self._shares_by_equity[equity]
                 shares[holding.period_end] = shares.get(holding.period_end, 0) + (holding.amount or 0)
+                self._latest_period = max(self._latest_period, holding.period_end)
                 self._rebalance = True
 
                 self.log(f"{self.time:%Y-%m-%d} {equity.value} - {holding.manager_name} reports "
@@ -85,8 +89,17 @@ class SEC13FAlgorithm(QCAlgorithm):
 
             # The manager's trades, which no filing states: the change between two reported quarters.
             if len(quarters) > 1:
-                self.log(f"{self.time:%Y-%m-%d} {equity.value}: {quarters[-2]:,.0f} -> {quarters[-1]:,.0f} shares "
-                         f"({quarters[-1] / quarters[-2] - 1:+.1%}) between {periods[-2]:%Y-%m-%d} and {periods[-1]:%Y-%m-%d}")
+                # A quarter the manager opened the position in reports no shares before it.
+                change = f" ({quarters[-1] / quarters[-2] - 1:+.1%})" if quarters[-2] > 0 else ""
+                self.log(f"{self.time:%Y-%m-%d} {equity.value}: {quarters[-2]:,.0f} -> {quarters[-1]:,.0f} shares"
+                         f"{change} between {periods[-2]:%Y-%m-%d} and {periods[-1]:%Y-%m-%d}")
+
+            # A position sold out of has no line in the new quarter, so its newest period stays
+            # behind the newest the manager reported anywhere. Taken for the name's own latest
+            # quarter, it would go on being compared with the quarter before it and held forever.
+            # Not being reported is a report of no shares.
+            if periods and periods[-1] < self._latest_period:
+                quarters.append(0)
 
             if quarters and (quarters[0] > 0 if len(quarters) == 1 else quarters[-1] > quarters[-2]):
                 selected.append(equity)
