@@ -75,28 +75,47 @@ namespace QuantConnect.DataProcessing
         /// <summary>The name a day's archive is cached and logged under.</summary>
         public static string ArchiveName(DateTime day) => $"edgar-{day.ToString(DateFormat.EightCharacter, CultureInfo.InvariantCulture)}_form13f.zip";
 
+        /// <summary>What building one day came to: its archive, or why there is none.</summary>
+        /// <param name="Path">The day's archive, or null when the day was not read.</param>
+        /// <param name="Filings">The holdings filings fetched, which is what reading the day cost.</param>
+        /// <param name="OverBudget">The day was left unread because it did not fit in what the run had left.</param>
+        public readonly record struct Built(string Path, int Filings, bool OverBudget);
+
         /// <summary>
-        /// Writes the day's archive into <paramref name="directory"/> and returns its path, or null
+        /// Writes the day's archive into <paramref name="directory"/> and returns its path, or no path
         /// when EDGAR has not published an index for the day, which is every weekend and holiday and a
         /// day whose index is late. <paramref name="listDirectory"/> returns the names in one of EDGAR's
         /// directory listings and <paramref name="getText"/> a file; both throw on any failure.
+        ///
+        /// <paramref name="filingBudget"/> is how many filings the caller has room left to fetch. The
+        /// index costs one round trip and each filing another, so the whole cost of a day is known
+        /// before the expensive part starts: a day that does not fit is left whole for the next run
+        /// rather than read in half.
         /// </summary>
-        public static string Build(DateTime day, string directory, Func<string, ISet<string>> listDirectory,
-            Func<string, string> getText)
+        public static Built Build(DateTime day, string directory, Func<string, ISet<string>> listDirectory,
+            Func<string, string> getText, int filingBudget = int.MaxValue)
         {
             var path = System.IO.Path.Combine(directory, ArchiveName(day));
             if (File.Exists(path))
             {
-                return path;
+                // Fetched already, by an earlier run or a test: it costs no round trip and no budget.
+                return new Built(path, 0, OverBudget: false);
             }
 
             if (!SECEdgarIndex.IsIndexPublished(day, listDirectory))
             {
-                return null;
+                return new Built(null, 0, OverBudget: false);
             }
 
             // The index lists a filing once for every CIK it names.
             var entries = SECEdgarIndex.DistinctFilings(ParseIndex(getText(SECEdgarIndex.IndexUrl(day))));
+            if (entries.Count > filingBudget)
+            {
+                Log.Trace($"SEC13FEdgarDay.Build(): {day:yyyy-MM-dd} carries {entries.Count} holdings filings and " +
+                          $"{filingBudget} are left in this run, so it is left whole for the next one");
+                return new Built(null, entries.Count, OverBudget: true);
+            }
+
             var filings = new List<Filing>(entries.Count);
             foreach (var entry in entries)
             {
@@ -108,7 +127,7 @@ namespace QuantConnect.DataProcessing
 
             Log.Trace($"SEC13FEdgarDay.Build(): {day:yyyy-MM-dd}: {filings.Count} holdings filings, " +
                       $"{filings.Sum(filing => filing.Lines.Count)} information table lines");
-            return path;
+            return new Built(path, filings.Count, OverBudget: false);
         }
 
         /// <summary>

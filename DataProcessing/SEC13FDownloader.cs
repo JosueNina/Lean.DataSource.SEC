@@ -101,15 +101,19 @@ namespace QuantConnect.DataProcessing
         private const int EdgarLookbackDays = 10;
 
         /// <summary>
-        /// How many EDGAR days one daily run reads. The run has an hour, and a deadline day carries
-        /// several thousand filings, so a long outage cannot be caught up in a single run: read the
-        /// oldest days the gap holds, publish them, and close the rest of it over the runs that
-        /// follow. Unbounded, a gap that does not fit in the hour fails every run and grows by a day
-        /// each time, and nothing is published again without someone stepping in.
+        /// How many holdings filings one daily run fetches before leaving the rest of a gap to the
+        /// runs that follow. Each filing is its own round trip, so this and not a count of days is
+        /// what a run's hour buys: over the June to August 2026 quarter a day carries 65 filings at
+        /// the median and 312 at the ninetieth percentile, and the 45 day deadline of 2026-08-14
+        /// carries 1,835, the heaviest of the quarter. The budget is that heaviest day, so catching
+        /// up never asks a run for more work than an ordinary run already does every quarter.
         /// </summary>
-        private const int MaxEdgarDaysPerRun = 5;
+        internal const int MaxFilingsPerRun = 2000;
 
         private const string PeriodFormat = "yyyyMMdd";
+
+        /// <summary>Where the manager's CIK sits in a published row, which is read back by column.</summary>
+        private const int ManagerCikColumn = 2;
 
         // N-PORT quarters folded into the crosswalk: a year reaches every security still trading.
         private const int NPortQuartersToFold = 4;
@@ -386,22 +390,35 @@ namespace QuantConnect.DataProcessing
         /// <summary>
         /// Reads each day's filings from EDGAR and folds them in like an archive. A weekday without an
         /// index is a holiday or a late index; it is not recorded, so a later run can still read it.
+        ///
+        /// A daily run stops once it has fetched a heaviest day's worth of filings, and the days left
+        /// are read by the runs that follow. Without that, a gap wider than the run's hour fails every
+        /// run, and since nothing is published until the last day of it is read, the gap grows by a
+        /// day each time and the data set never moves again.
         /// </summary>
         private void ProcessEdgarDays(List<DateTime> days)
         {
             var read = 0;
+            var fetched = 0;
             foreach (var day in days)
             {
-                var path = SEC13FEdgarDay.Build(day, _archiveCacheDirectory, _edgar.ListDirectory, url => _edgar.GetText(url));
-                if (path == null)
+                var built = SEC13FEdgarDay.Build(day, _archiveCacheDirectory, _edgar.ListDirectory,
+                    url => _edgar.GetText(url), FilingBudget(read, fetched));
+                if (built.OverBudget)
+                {
+                    break;
+                }
+
+                if (built.Path == null)
                 {
                     Log.Trace($"SEC13FDownloader.ProcessEdgarDays(): EDGAR lists no index for {day:yyyy-MM-dd}");
                     continue;
                 }
 
-                ProcessArchive(new Archive(Path.GetFileName(path), SECEdgarIndex.IndexUrl(day), day, day, IsDaily: true));
+                ProcessArchive(new Archive(Path.GetFileName(built.Path), SECEdgarIndex.IndexUrl(day), day, day, IsDaily: true));
                 FlushPendingRows();
                 _edgarDays.Add(day);
+                fetched += built.Filings;
                 read++;
             }
 
@@ -442,9 +459,20 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>
+        /// How many filings a run may still fetch, having read <paramref name="read"/> days and
+        /// fetched <paramref name="fetched"/> filings. The rebuild reads its whole window by design,
+        /// and a daily run gives its first day the budget whole: a day is the unit of work and cannot
+        /// be read in half, and its heaviest is what an ordinary run already does every quarter.
+        /// </summary>
+        internal int FilingBudget(int read, int fetched)
+        {
+            return _deploymentDate == null || read == 0 ? int.MaxValue : MaxFilingsPerRun - fetched;
+        }
+
+        /// <summary>
         /// The weekdays from one date to another that no earlier run has folded in, never before the
-        /// day EDGAR took over from the data sets. A daily run takes the oldest MaxEdgarDaysPerRun of
-        /// them, so a gap is closed over several runs rather than attempted whole in each.
+        /// day EDGAR took over from the data sets. These are the days a run may read; how many of them
+        /// it does read is decided as it goes, by what each one costs.
         /// </summary>
         internal List<DateTime> EdgarDaysToRead(DateTime from, DateTime until)
         {
@@ -456,15 +484,6 @@ namespace QuantConnect.DataProcessing
                 {
                     days.Add(day);
                 }
-            }
-
-            // Only the daily run is on the clock. The rebuild reads the whole history by design, and
-            // capping it would leave the first release short of the day it says it reaches.
-            if (_deploymentDate != null && days.Count > MaxEdgarDaysPerRun)
-            {
-                Log.Trace($"SEC13FDownloader.EdgarDaysToRead(): {days.Count} days to fold in, reading the oldest " +
-                          $"{MaxEdgarDaysPerRun} through {days[MaxEdgarDaysPerRun - 1]:yyyy-MM-dd}; the rest follow tomorrow");
-                days.RemoveRange(MaxEdgarDaysPerRun, days.Count - MaxEdgarDaysPerRun);
             }
 
             return days;
@@ -2131,14 +2150,20 @@ namespace QuantConnect.DataProcessing
                 }
             }
 
+            var newerThanThisRun = ManagersPublishedAfter(_managerNames.Values
+                .Where(manager => manager.Filed <= _foldedThrough)
+                .Select(manager => manager.Filed)
+                .DefaultIfEmpty(DateTime.MaxValue)
+                .Min());
+
             foreach (var (cik, manager) in _managerNames)
             {
-                // The published file carries no filing date, and the names in it are those of the
-                // days folded in before this run. A day whose index came late is read after newer
-                // days were already published, so its filing is not the manager's latest and taking
-                // its name would roll the published one back until the manager files again. A CIK
-                // the file does not carry yet is new whatever day it filed on.
-                if (manager.Filed > _foldedThrough || !names.ContainsKey(cik))
+                // The name a manager files under is the one it carries today, so only its latest
+                // filing may name it. The published file carries no date to say when the name in it
+                // was filed, and a day whose index came late is read after newer days are already
+                // published, so the date is taken from the published rows themselves: a manager that
+                // filed again between this filing and what is published keeps the published name.
+                if (!newerThanThisRun.TryGetValue(cik, out var newer) || newer < manager.Filed)
                 {
                     names[cik] = manager.Name;
                 }
@@ -2151,6 +2176,66 @@ namespace QuantConnect.DataProcessing
 
             Log.Trace($"SEC13FDownloader.WriteManagerNames(): {names.Count} managers, " +
                       $"{_managerNames.Count} of them seen this run");
+        }
+
+        /// <summary>
+        /// The newest filing date each manager already has published in the days after
+        /// <paramref name="after"/>, read from the published rows themselves. managers.csv carries no
+        /// date, so this is where the date of a published name comes from: a manager that filed again
+        /// between the filing this run read and what is published is not renamed by the older one.
+        ///
+        /// Only a run folding in a day older than the last one already folded in asks for this, which
+        /// means a day whose index EDGAR published late, so an ordinary daily run never reaches here.
+        /// It costs one pass over the published zips, whose central directories answer for every date
+        /// they do not hold, so only the entries of those few days are read.
+        ///
+        /// A manager whose every line failed to resolve has no published row and is not found here,
+        /// and is then named by its older filing: a stale name rather than a wrong number.
+        /// </summary>
+        private Dictionary<int, DateTime> ManagersPublishedAfter(DateTime after)
+        {
+            var managers = new Dictionary<int, DateTime>();
+            if (after >= _foldedThrough || !Directory.Exists(_processedDataDirectory))
+            {
+                return managers;
+            }
+
+            var entries = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+            for (var day = after.AddDays(1); day <= _foldedThrough; day = day.AddDays(1))
+            {
+                entries[$"{day.ToStringInvariant(PeriodFormat)}.csv"] = day;
+            }
+
+            var read = 0;
+            foreach (var file in Directory.EnumerateFiles(_processedDataDirectory, "*.zip"))
+            {
+                using var zip = ZipFile.OpenRead(file);
+                foreach (var entry in zip.Entries)
+                {
+                    if (!entries.TryGetValue(entry.Name, out var filed))
+                    {
+                        continue;
+                    }
+
+                    using var reader = new StreamReader(entry.Open());
+                    while (reader.ReadLine() is { } line)
+                    {
+                        var fields = line.Split(',');
+                        if (fields.Length > ManagerCikColumn &&
+                            int.TryParse(fields[ManagerCikColumn], NumberStyles.Integer, CultureInfo.InvariantCulture, out var cik) &&
+                            (!managers.TryGetValue(cik, out var known) || known < filed))
+                        {
+                            managers[cik] = filed;
+                        }
+                    }
+
+                    read++;
+                }
+            }
+
+            Log.Trace($"SEC13FDownloader.ManagersPublishedAfter(): {managers.Count} managers already published a " +
+                      $"filing in the {entries.Count} days after {after:yyyy-MM-dd}, read from {read} entries");
+            return managers;
         }
 
         /// <summary>One published row: a single reported position, on the date it was filed.</summary>

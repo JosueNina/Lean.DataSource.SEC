@@ -1260,11 +1260,11 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         /// <summary>One filing of CIK 7 on a day, holding a line that resolves, under the name given.</summary>
-        private static SEC13FEdgarDay.Filing NamedFiling(DateTime day, string name)
+        private static SEC13FEdgarDay.Filing NamedFiling(DateTime day, string name, int cik = 7)
         {
             var filing = new SEC13FEdgarDay.Filing
             {
-                Accession = $"0000000007-26-{day:MMdd}01", SubmissionType = "13F-HR", Cik = 7, Filed = day,
+                Accession = $"{cik:0000000000}-26-{day:MMdd}01", SubmissionType = "13F-HR", Cik = cik, Filed = day,
                 Period = new DateTime(2026, 6, 30), ManagerName = name
             };
 
@@ -1293,26 +1293,84 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
-        public void AManagerKeepsItsPublishedNameWhenALateDayIsFoldedInAfterANewerOne()
+        public void AManagerThatFiledAgainKeepsItsPublishedName()
         {
-            // The run before this one folded in 09-09 and published the name that day's filing
-            // states. This run reaches back to 09-08, whose index EDGAR published late: its filing
-            // is older than what is published, and managers.csv carries no date to say so.
+            // The run before this one folded in 09-09 and published the name the manager filed that
+            // day. This run reaches back to 09-08, whose index EDGAR published late, where the same
+            // manager filed under its older name. managers.csv carries no date to say the published
+            // name is the newer one, so the manager's own published rows are what say it.
+            var shelf = LateDayShelf(publishedName: "NEWCO ASSET MGMT", filedOn0909: 7);
+
+            Assert.AreEqual(new[] { "7,NEWCO ASSET MGMT" }, FoldInTheLateDay(shelf, "OLDCO ASSET MGMT"));
+        }
+
+        [Test]
+        public void AManagerThatDidNotFileAgainTakesTheNameOfTheLateDay()
+        {
+            // A manager files once a quarter, so the late day usually carries its only filing of the
+            // window, and then that filing is the one that names it. Deciding from the last day the
+            // run folded in rather than from this manager's own rows threw the name away for every
+            // manager that had not filed since, which on a late deadline day is nearly all of them.
+            var shelf = LateDayShelf(publishedName: "OLDCO ASSET MGMT", filedOn0909: 99);
+
+            Assert.AreEqual(new[] { "7,NEWCO ASSET MGMT" }, FoldInTheLateDay(shelf, "NEWCO ASSET MGMT"));
+        }
+
+        [Test]
+        public void AManagerIsNamedByItsLatestFilingWhenTwoLateDaysAreFoldedInAtOnce()
+        {
+            // Two indexes came late, so this run folds in 09-03 and 09-08 at once. CIK 7's published
+            // rows are of 09-04, inside the window the scan covers but older than the 09-08 filing
+            // this run read, so 09-08 is what names the manager. Knowing only which managers have
+            // published rows in the window, without the date of each, would keep the older name here
+            // and lose the rename, which is the whole reason the date is read off the rows.
             SeedMapFiles("aapl");
             var shelf = PublishedShelf();
-            File.WriteAllLines(Path.Combine(shelf, "edgar-days.txt"), ["#from 20260601", "20260909"]);
-            File.WriteAllLines(Path.Combine(shelf, "managers.csv"), ["7,NEWCO ASSET MGMT"]);
+            File.WriteAllLines(Path.Combine(shelf, "edgar-days.txt"), ["#from 20260601", "20260904", "20260909"]);
+            File.WriteAllLines(Path.Combine(shelf, "managers.csv"), ["7,OLDCO ASSET MGMT"]);
+            SeedPublishedZip(shelf, "aapl", 7, "20260904");
 
             using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
                 new DateTime(2026, 9, 11), Path.Combine(_root, "raw"));
             downloader.TickerCrosswalk = UnitTestCrosswalk();
             downloader.ReadEdgarState();
 
-            ProcessEdgarDay(downloader, new DateTime(2026, 9, 8), NamedFiling(new DateTime(2026, 9, 8), "OLDCO ASSET MGMT"));
+            ProcessEdgarDay(downloader, new DateTime(2026, 9, 3),
+                NamedFiling(new DateTime(2026, 9, 3), "OTHER MANAGER LP", cik: 99));
+            ProcessEdgarDay(downloader, new DateTime(2026, 9, 8),
+                NamedFiling(new DateTime(2026, 9, 8), "NEWCO ASSET MGMT"));
             downloader.FinalizeSecurityFiles();
 
-            Assert.AreEqual(new[] { "7,NEWCO ASSET MGMT" },
+            Assert.AreEqual(new[] { "7,NEWCO ASSET MGMT", "99,OTHER MANAGER LP" },
                 File.ReadAllLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv")));
+        }
+
+        /// <summary>
+        /// A published history reaching 09-09, naming CIK 7, whose rows of 09-09 were filed by
+        /// <paramref name="filedOn0909"/>. The day 09-08 is missing: EDGAR published its index late.
+        /// </summary>
+        private string LateDayShelf(string publishedName, int filedOn0909)
+        {
+            SeedMapFiles("aapl");
+            var shelf = PublishedShelf();
+            File.WriteAllLines(Path.Combine(shelf, "edgar-days.txt"), ["#from 20260601", "20260909"]);
+            File.WriteAllLines(Path.Combine(shelf, "managers.csv"), [$"7,{publishedName}"]);
+            SeedPublishedZip(shelf, "aapl", filedOn0909, "20260909");
+            return shelf;
+        }
+
+        /// <summary>Folds 09-08 into that history, with CIK 7 filing under the name given.</summary>
+        private string[] FoldInTheLateDay(string shelf, string name)
+        {
+            using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                new DateTime(2026, 9, 11), Path.Combine(_root, "raw"));
+            downloader.TickerCrosswalk = UnitTestCrosswalk();
+            downloader.ReadEdgarState();
+
+            ProcessEdgarDay(downloader, new DateTime(2026, 9, 8), NamedFiling(new DateTime(2026, 9, 8), name));
+            downloader.FinalizeSecurityFiles();
+
+            return File.ReadAllLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv"));
         }
 
         [Test]
@@ -1332,50 +1390,114 @@ namespace QuantConnect.DataLibrary.Tests
                 downloader.FirstDayToCatchUp(new DateTime(2026, 9, 9)), new DateTime(2026, 9, 9));
 
             Assert.AreEqual("20260817", days[0].ToString("yyyyMMdd"), "the day after the last one folded in");
-            Assert.AreEqual("20260821", days[^1].ToString("yyyyMMdd"), "as many as the hour holds, the rest tomorrow");
+            Assert.AreEqual("20260909", days[^1].ToString("yyyyMMdd"));
             Assert.IsFalse(days.Contains(new DateTime(2026, 8, 14)), "a day already folded in is not read again");
         }
 
-        [Test]
-        public void AGapWiderThanARunIsClosedOverSeveralRuns()
+        /// <summary>
+        /// Holdings filings per day, counted over the June to August 2026 data set: the five weekdays
+        /// leading to the 45 day deadline, the deadline itself, and a quiet day for the rest.
+        /// </summary>
+        private static int FilingsOn(DateTime day) => day.ToString("yyyyMMdd") switch
         {
-            // Nineteen weekdays of outage, one of them the 45 day deadline with its several thousand
-            // filings, do not fit in the run's hour. Attempted whole they fail it, and since nothing
-            // is published until every day is read, the next run starts over with one day more: the
-            // gap never closes and the data set never moves again.
+            "20260810" => 355,
+            "20260811" => 449,
+            "20260812" => 461,
+            "20260813" => 742,
+            "20260814" => 1835,
+            _ => 65
+        };
+
+        [Test]
+        public void AGapWiderThanARunIsClosedWithoutOutweighingAnOrdinaryRun()
+        {
+            // Nineteen weekdays of outage, the 45 day deadline among them, do not fit in the run's
+            // hour. Read whole they fail it, and since nothing is published until the last of them
+            // is read, the next run starts over one day further behind: the gap never closes and the
+            // data set never moves again. Read by weight, every run finishes and the gap shrinks.
             var shelf = PublishedShelf();
             var deployment = new DateTime(2026, 9, 9);
             var folded = new List<string> { "20260807" };
+            var runs = 0;
 
-            for (var run = 0; run < 5; run++)
+            while (folded[^1] != "20260909")
             {
+                Assert.Less(++runs, 20, "the gap has to close");
                 File.WriteAllLines(Path.Combine(shelf, "edgar-days.txt"), folded.Prepend("#from 20260601"));
 
                 using var downloader = new SEC13FDownloader(
                     Path.Combine(_root, "out"), Path.Combine(_root, "processed"), deployment);
                 downloader.ReadEdgarState();
 
-                var days = downloader.EdgarDaysToRead(downloader.FirstDayToCatchUp(deployment), deployment);
-                Assert.LessOrEqual(days.Count, 5, "a run reads what it can finish");
-                folded.AddRange(days.Select(day => day.ToString("yyyyMMdd")));
-            }
+                // What ProcessEdgarDays does with what EdgarDaysToRead offers it.
+                var read = 0;
+                var fetched = 0;
+                var first = 0;
+                foreach (var day in downloader.EdgarDaysToRead(downloader.FirstDayToCatchUp(deployment), deployment))
+                {
+                    if (FilingsOn(day) > downloader.FilingBudget(read, fetched))
+                    {
+                        break;
+                    }
 
-            Assert.AreEqual("20260909", folded[^1], "five runs and the gap is closed");
+                    first = read == 0 ? FilingsOn(day) : first;
+                    fetched += FilingsOn(day);
+                    read++;
+                    folded.Add(day.ToString("yyyyMMdd"));
+                }
+
+                // The budget, or the first day alone where that day is heavier than the budget:
+                // one exempt day and the rest inside what is left of it. A run that reached the
+                // exemption twice would fetch more than this and still close the gap.
+                Assert.Greater(read, 0, "a run that reads nothing never closes the gap");
+                Assert.LessOrEqual(fetched, Math.Max(SEC13FDownloader.MaxFilingsPerRun, first),
+                    "no run outweighs the heaviest day an ordinary run already carries");
+            }
         }
 
         [Test]
-        public void ARebuildReadsEveryEdgarDayItsWindowHolds()
+        public void TheFirstDayOfARunIsReadWhateverItWeighs()
         {
-            // The cap is the daily run's, which has an hour. The rebuild states the day it reaches
-            // in edgar-days.txt, so reading five days of a three month window would publish a history
-            // that stops short of what it claims.
-            using var downloader = new SEC13FDownloader(
+            // A day is the unit of work: it cannot be read in half, and the heaviest of them is what
+            // an ordinary run does every quarter anyway. Budgeted like any other, the deadline day
+            // would never be read and the gap behind it would never close.
+            using var daily = new SEC13FDownloader(
+                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), new DateTime(2026, 9, 9));
+
+            Assert.AreEqual(int.MaxValue, daily.FilingBudget(read: 0, fetched: 0));
+            Assert.AreEqual(SEC13FDownloader.MaxFilingsPerRun - 1835, daily.FilingBudget(read: 1, fetched: 1835));
+            Assert.Less(daily.FilingBudget(read: 2, fetched: SEC13FDownloader.MaxFilingsPerRun), 1, "nothing is left");
+
+            using var rebuild = new SEC13FDownloader(
                 Path.Combine(_root, "out"), Path.Combine(_root, "processed"), null, Path.Combine(_root, "raw"));
 
-            var days = downloader.EdgarDaysToRead(new DateTime(2026, 6, 1), new DateTime(2026, 9, 9));
+            Assert.AreEqual(int.MaxValue, rebuild.FilingBudget(read: 40, fetched: 500000),
+                "the rebuild states the day it reaches, so it reads its whole window");
+        }
 
-            Assert.AreEqual(73, days.Count, "every weekday of the window");
-            Assert.AreEqual("20260909", days[^1].ToString("yyyyMMdd"));
+        [Test]
+        public void ADayThatDoesNotFitIsLeftWholeAndNothingOfItIsFetched()
+        {
+            // The index costs one round trip and every filing another, so the weight of a day is
+            // known before the expensive part. Half a day read is worse than none: the archive is
+            // written once and a later run would take it for the whole day.
+            var index = string.Join('\n', Enumerable.Range(1, 40).Select(filing =>
+                $"13F-HR           SOME MANAGER LP            {filing}   20260814   edgar/data/{filing}/0000000000-26-{filing:000000}.txt"));
+
+            var fetches = new List<string>();
+            var built = SEC13FEdgarDay.Build(new DateTime(2026, 8, 14), _root,
+                _ => new HashSet<string> { "2026", "QTR3", "form.20260814.idx" },
+                url =>
+                {
+                    fetches.Add(url);
+                    return url.EndsWith(".idx", StringComparison.Ordinal) ? index : throw new InvalidOperationException(url);
+                },
+                filingBudget: 39);
+
+            Assert.IsTrue(built.OverBudget);
+            Assert.IsNull(built.Path, "nothing was written, so the next run reads the day whole");
+            Assert.AreEqual(40, built.Filings, "and the caller is told what it would have cost");
+            Assert.AreEqual(1, fetches.Count, "the index and not one filing");
         }
 
         [Test]
@@ -1711,11 +1833,17 @@ namespace QuantConnect.DataLibrary.Tests
         /// <summary>A published security zip holding one entry per date given.</summary>
         private static void SeedPublishedZip(string shelf, string ticker, params string[] dates)
         {
+            SeedPublishedZip(shelf, ticker, 1, dates);
+        }
+
+        /// <summary>A published security zip whose every row was filed by one manager.</summary>
+        private static void SeedPublishedZip(string shelf, string ticker, int cik, params string[] dates)
+        {
             using var zip = ZipFile.Open(Path.Combine(shelf, $"{ticker}.zip"), ZipArchiveMode.Create);
             foreach (var date in dates)
             {
                 using var writer = new StreamWriter(zip.CreateEntry($"{date}.csv").Open());
-                writer.Write($"{date},0000000000-24-000001,1,20231231,13F-HR,,,COM,1,SH,1,0,,SOLE,,1,0,0,0,\n");
+                writer.Write($"{date},0000000000-24-000001,{cik},20231231,13F-HR,,,COM,1,SH,1,0,,SOLE,,1,0,0,0,\n");
             }
         }
 
