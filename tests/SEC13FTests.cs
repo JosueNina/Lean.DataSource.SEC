@@ -284,6 +284,7 @@ namespace QuantConnect.DataLibrary.Tests
             var retry = SEC13FManagerNameProvider.RetryInterval;
             var root = Path.Combine(Path.GetTempPath(), $"sec-13f-names-{Guid.NewGuid():N}");
             var folder = Path.Combine(root, "alternative", "sec", "13f");
+            var file = Path.Combine(folder, "managers.csv");
             Directory.CreateDirectory(folder);
 
             try
@@ -292,9 +293,18 @@ namespace QuantConnect.DataLibrary.Tests
                 Globals.Reset();
                 SEC13FManagerNameProvider.Reset();
 
+                // A read that found the file stamps the day, and Reset drops that stamp along with
+                // the names. Left behind it would stand as the answer for the day this test is
+                // about, and whether an earlier test in the process stamped it would decide the
+                // outcome here.
+                File.WriteAllLines(file, ["1067983,BERKSHIRE HATHAWAY INC"]);
+                Assert.AreEqual("BERKSHIRE HATHAWAY INC", Read(FullLine).ManagerName, "the day is stamped");
+                File.Delete(file);
+                SEC13FManagerNameProvider.Reset();
+
                 Assert.IsNull(Read(FullLine).ManagerName, "there is no file yet");
 
-                File.WriteAllLines(Path.Combine(folder, "managers.csv"), ["1067983,BERKSHIRE HATHAWAY INC"]);
+                File.WriteAllLines(file, ["1067983,BERKSHIRE HATHAWAY INC"]);
                 SEC13FManagerNameProvider.RetryInterval = TimeSpan.Zero;
 
                 Assert.AreEqual("BERKSHIRE HATHAWAY INC", Read(FullLine).ManagerName, "and now there is");

@@ -100,6 +100,15 @@ namespace QuantConnect.DataProcessing
         /// <summary>How far back a daily run looks for a day whose index EDGAR published late.</summary>
         private const int EdgarLookbackDays = 10;
 
+        /// <summary>
+        /// How many EDGAR days one daily run reads. The run has an hour, and a deadline day carries
+        /// several thousand filings, so a long outage cannot be caught up in a single run: read the
+        /// oldest days the gap holds, publish them, and close the rest of it over the runs that
+        /// follow. Unbounded, a gap that does not fit in the hour fails every run and grows by a day
+        /// each time, and nothing is published again without someone stepping in.
+        /// </summary>
+        private const int MaxEdgarDaysPerRun = 5;
+
         private const string PeriodFormat = "yyyyMMdd";
 
         // N-PORT quarters folded into the crosswalk: a year reaches every security still trading.
@@ -244,6 +253,9 @@ namespace QuantConnect.DataProcessing
 
         /// <summary>EDGAR days already folded into the history, published so a daily run never reads one twice.</summary>
         private readonly SortedSet<DateTime> _edgarDays = new();
+
+        /// <summary>The last day folded in before this run, which dates what the published files state.</summary>
+        private DateTime _foldedThrough;
 
         private readonly DateTime? _edgarFrom;
         private readonly DateTime? _edgarUntil;
@@ -431,7 +443,8 @@ namespace QuantConnect.DataProcessing
 
         /// <summary>
         /// The weekdays from one date to another that no earlier run has folded in, never before the
-        /// day EDGAR took over from the data sets.
+        /// day EDGAR took over from the data sets. A daily run takes the oldest MaxEdgarDaysPerRun of
+        /// them, so a gap is closed over several runs rather than attempted whole in each.
         /// </summary>
         internal List<DateTime> EdgarDaysToRead(DateTime from, DateTime until)
         {
@@ -443,6 +456,15 @@ namespace QuantConnect.DataProcessing
                 {
                     days.Add(day);
                 }
+            }
+
+            // Only the daily run is on the clock. The rebuild reads the whole history by design, and
+            // capping it would leave the first release short of the day it says it reaches.
+            if (_deploymentDate != null && days.Count > MaxEdgarDaysPerRun)
+            {
+                Log.Trace($"SEC13FDownloader.EdgarDaysToRead(): {days.Count} days to fold in, reading the oldest " +
+                          $"{MaxEdgarDaysPerRun} through {days[MaxEdgarDaysPerRun - 1]:yyyy-MM-dd}; the rest follow tomorrow");
+                days.RemoveRange(MaxEdgarDaysPerRun, days.Count - MaxEdgarDaysPerRun);
             }
 
             return days;
@@ -629,8 +651,12 @@ namespace QuantConnect.DataProcessing
                     "took over from the data sets, so a daily run could read a day twice. Republish with a full history run.");
             }
 
+            // What the published files state, they state as of this day. A full run leaves it at
+            // MinValue, since it publishes everything itself.
+            _foldedThrough = _edgarDays.Max;
+
             Log.Trace($"SEC13FDownloader.ReadEdgarState(): EDGAR from {_edgarFirstDay:yyyy-MM-dd}, {_edgarDays.Count} " +
-                      $"days already published, the last {_edgarDays.Max:yyyy-MM-dd}");
+                      $"days already published, the last {_foldedThrough:yyyy-MM-dd}");
         }
 
         /// <summary>Publishes the day EDGAR took over and the days folded in so far, oldest first.</summary>
@@ -903,7 +929,7 @@ namespace QuantConnect.DataProcessing
             public decimal? ReportedValue { get; init; }
 
             /// <summary>The power of ten that turns <see cref="ReportedValue"/> into whole dollars.</summary>
-            public int ValueScale { get; set; }
+            public int ValueScale { get; init; }
 
             public string PutCall { get; set; }
             public string InvestmentDiscretion { get; init; }
@@ -1339,6 +1365,8 @@ namespace QuantConnect.DataProcessing
         /// own. An option line reports the value and the number of the underlying shares, so its
         /// implied price is the underlying's, and the line goes to the one issue whose quarter-end
         /// close it matches, in dollars or in thousands. No match, or more than one, drops the line.
+        /// The close names the fund and nothing else. An option line has no price of its own, so it
+        /// keeps its filing's unit, like every other option line and like the bond at par beside it.
         /// </summary>
         private void EmitOptionLinesByPrice(HoldingKey key, Holding holding)
         {
@@ -1354,11 +1382,7 @@ namespace QuantConnect.DataProcessing
             foreach (var line in holding.Lines)
             {
                 var matches = line.Amount > 0m && line.ReportedValue > 0m
-                    ? candidates
-                        .Select(candidate => (candidate.Security,
-                            Scale: ScaleAgainstClose(line.ReportedValue.Value / line.Amount.Value, candidate.Close.Value)))
-                        .Where(candidate => candidate.Scale != null)
-                        .ToList()
+                    ? candidates.Where(candidate => MatchesClose(line.ReportedValue.Value / line.Amount.Value, candidate.Close.Value)).ToList()
                     : [];
 
                 var ticker = matches.Count == 1 ? ResolveTicker(matches[0].Security, key.FilingDate) : null;
@@ -1369,11 +1393,6 @@ namespace QuantConnect.DataProcessing
                     continue;
                 }
 
-                // The fund and the unit are read off the same close, so the line takes its own
-                // price the way a share line does: it had to take its filing's only for as long as
-                // there was no close to measure it against.
-                line.ValueScale = matches[0].Scale.Value;
-
                 InferOptionSide(key.Cusip, line);
                 _optionLinesByPrice++;
                 _resolvedValue += line.DollarValue;
@@ -1382,22 +1401,11 @@ namespace QuantConnect.DataProcessing
         }
 
         /// <summary>Whether a price is a close, stated in dollars or in thousands, within OptionPriceTolerance.</summary>
-        internal static bool MatchesClose(decimal price, decimal close) => ScaleAgainstClose(price, close) != null;
-
-        /// <summary>
-        /// The power of ten that turns the value behind <paramref name="price"/> into dollars, when
-        /// that price is the close within OptionPriceTolerance, and null when it is not a close at
-        /// all. Zero for a line in dollars and three for one in thousands.
-        /// </summary>
-        internal static int? ScaleAgainstClose(decimal price, decimal close)
+        internal static bool MatchesClose(decimal price, decimal close)
         {
-            var ratio = (double)(price / close);
-            if (Math.Abs(ratio - 1) <= OptionPriceTolerance)
-            {
-                return 0;
-            }
-
-            return Math.Abs(ratio * 1000 - 1) <= OptionPriceTolerance ? 3 : null;
+            var ratio = price / close;
+            return Math.Abs((double)ratio - 1) <= OptionPriceTolerance ||
+                   Math.Abs((double)ratio * 1000 - 1) <= OptionPriceTolerance;
         }
 
         /// <summary>
@@ -1999,7 +2007,11 @@ namespace QuantConnect.DataProcessing
         {
             if (_stagedSecurities.Count == 0)
             {
-                Log.Trace("SEC13FDownloader.FinalizeSecurityFiles(): nothing was written");
+                // A day can carry filings whose every line fails to resolve, and it is recorded as
+                // folded in all the same, so no later run reads its cover pages again: the names it
+                // gave are written now or never.
+                Log.Trace("SEC13FDownloader.FinalizeSecurityFiles(): no rows were staged");
+                WriteManagerNames();
                 return;
             }
 
@@ -2101,6 +2113,7 @@ namespace QuantConnect.DataProcessing
         /// </summary>
         private void WriteManagerNames()
         {
+            Directory.CreateDirectory(_destinationDirectory);
             var path = Path.Combine(_destinationDirectory, ManagerNamesFileName);
             var names = new Dictionary<int, string>();
 
@@ -2120,7 +2133,15 @@ namespace QuantConnect.DataProcessing
 
             foreach (var (cik, manager) in _managerNames)
             {
-                names[cik] = manager.Name;
+                // The published file carries no filing date, and the names in it are those of the
+                // days folded in before this run. A day whose index came late is read after newer
+                // days were already published, so its filing is not the manager's latest and taking
+                // its name would roll the published one back until the manager files again. A CIK
+                // the file does not carry yet is new whatever day it filed on.
+                if (manager.Filed > _foldedThrough || !names.ContainsKey(cik))
+                {
+                    names[cik] = manager.Name;
+                }
             }
 
             // Sanitized here and not only where the cover page is read, because the names folded in

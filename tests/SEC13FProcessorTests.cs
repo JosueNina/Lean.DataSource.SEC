@@ -1192,12 +1192,12 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
-        public void AnOptionLineTakesTheUnitItsCloseProves()
+        public void AnOptionLineNamedByItsCloseStillTakesItsFilingsUnit()
         {
-            // The filing has no share line, so its own unit is only the SEC rule for its date, which
-            // after 2023 says dollars. The close the line was matched on says thousands, and it is
-            // the one reading here that looked at a price: published in dollars the value would be
-            // a thousandfold short.
+            // The close names the fund, not the unit. An option line has no price of its own to hold
+            // against a close, so reading the unit off the fund it matched would state two units for
+            // one filing: the same manager's lines on a single-issue CUSIP never see a close. The
+            // filing's unit is the one every option line takes, right or wrong, for all of them.
             var iwm = SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), "IWM", Market.USA);
             var eem = SecurityIdentifier.GenerateEquity(new DateTime(1980, 12, 12), "EEM", Market.USA);
             SeedMapFiles("iwm", "eem");
@@ -1212,7 +1212,7 @@ namespace QuantConnect.DataLibrary.Tests
 
             var row = PublishedRows(day, filing, "iwm").Single().Split(',');
             Assert.AreEqual("22", row[10], "the manager's number is published untouched");
-            Assert.AreEqual("3", row[11]);
+            Assert.AreEqual("0", row[11], "the filing is after 2023, so its rule says dollars");
         }
 
         [TestCase(220, 220, true)]
@@ -1273,6 +1273,49 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         [Test]
+        public void ADayThatStagedNoRowStillPublishesTheManagersItRead()
+        {
+            // A quiet day can carry only filings whose every line fails to resolve. The day is
+            // recorded as folded in all the same, so no later run reads its cover pages again: a
+            // name not written here is lost until the manager files a line that does resolve.
+            SeedMapFiles("msft");
+            var day = new DateTime(2026, 8, 14);
+            using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                day, Path.Combine(_root, "raw"));
+            downloader.TickerCrosswalk = UnitTestCrosswalk();
+
+            ProcessEdgarDay(downloader, day, NamedFiling(day, "NEWCO ASSET MGMT"));
+            downloader.FinalizeSecurityFiles();
+
+            var destination = Path.Combine(_root, "out", SEC13FHolding.ReportFolder);
+            Assert.IsEmpty(Directory.GetFiles(destination, "*.zip"), "nothing resolved");
+            Assert.AreEqual(new[] { "7,NEWCO ASSET MGMT" }, File.ReadAllLines(Path.Combine(destination, "managers.csv")));
+        }
+
+        [Test]
+        public void AManagerKeepsItsPublishedNameWhenALateDayIsFoldedInAfterANewerOne()
+        {
+            // The run before this one folded in 09-09 and published the name that day's filing
+            // states. This run reaches back to 09-08, whose index EDGAR published late: its filing
+            // is older than what is published, and managers.csv carries no date to say so.
+            SeedMapFiles("aapl");
+            var shelf = PublishedShelf();
+            File.WriteAllLines(Path.Combine(shelf, "edgar-days.txt"), ["#from 20260601", "20260909"]);
+            File.WriteAllLines(Path.Combine(shelf, "managers.csv"), ["7,NEWCO ASSET MGMT"]);
+
+            using var downloader = new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"),
+                new DateTime(2026, 9, 11), Path.Combine(_root, "raw"));
+            downloader.TickerCrosswalk = UnitTestCrosswalk();
+            downloader.ReadEdgarState();
+
+            ProcessEdgarDay(downloader, new DateTime(2026, 9, 8), NamedFiling(new DateTime(2026, 9, 8), "OLDCO ASSET MGMT"));
+            downloader.FinalizeSecurityFiles();
+
+            Assert.AreEqual(new[] { "7,NEWCO ASSET MGMT" },
+                File.ReadAllLines(Path.Combine(_root, "out", SEC13FHolding.ReportFolder, "managers.csv")));
+        }
+
+        [Test]
         public void AnIncrementalRunReachesBackToTheDaysAnOutageMissed()
         {
             // EDGAR blocked the runner for a fortnight, so every run in between failed. Reading only
@@ -1289,8 +1332,50 @@ namespace QuantConnect.DataLibrary.Tests
                 downloader.FirstDayToCatchUp(new DateTime(2026, 9, 9)), new DateTime(2026, 9, 9));
 
             Assert.AreEqual("20260817", days[0].ToString("yyyyMMdd"), "the day after the last one folded in");
-            Assert.AreEqual("20260909", days[^1].ToString("yyyyMMdd"));
+            Assert.AreEqual("20260821", days[^1].ToString("yyyyMMdd"), "as many as the hour holds, the rest tomorrow");
             Assert.IsFalse(days.Contains(new DateTime(2026, 8, 14)), "a day already folded in is not read again");
+        }
+
+        [Test]
+        public void AGapWiderThanARunIsClosedOverSeveralRuns()
+        {
+            // Nineteen weekdays of outage, one of them the 45 day deadline with its several thousand
+            // filings, do not fit in the run's hour. Attempted whole they fail it, and since nothing
+            // is published until every day is read, the next run starts over with one day more: the
+            // gap never closes and the data set never moves again.
+            var shelf = PublishedShelf();
+            var deployment = new DateTime(2026, 9, 9);
+            var folded = new List<string> { "20260807" };
+
+            for (var run = 0; run < 5; run++)
+            {
+                File.WriteAllLines(Path.Combine(shelf, "edgar-days.txt"), folded.Prepend("#from 20260601"));
+
+                using var downloader = new SEC13FDownloader(
+                    Path.Combine(_root, "out"), Path.Combine(_root, "processed"), deployment);
+                downloader.ReadEdgarState();
+
+                var days = downloader.EdgarDaysToRead(downloader.FirstDayToCatchUp(deployment), deployment);
+                Assert.LessOrEqual(days.Count, 5, "a run reads what it can finish");
+                folded.AddRange(days.Select(day => day.ToString("yyyyMMdd")));
+            }
+
+            Assert.AreEqual("20260909", folded[^1], "five runs and the gap is closed");
+        }
+
+        [Test]
+        public void ARebuildReadsEveryEdgarDayItsWindowHolds()
+        {
+            // The cap is the daily run's, which has an hour. The rebuild states the day it reaches
+            // in edgar-days.txt, so reading five days of a three month window would publish a history
+            // that stops short of what it claims.
+            using var downloader = new SEC13FDownloader(
+                Path.Combine(_root, "out"), Path.Combine(_root, "processed"), null, Path.Combine(_root, "raw"));
+
+            var days = downloader.EdgarDaysToRead(new DateTime(2026, 6, 1), new DateTime(2026, 9, 9));
+
+            Assert.AreEqual(73, days.Count, "every weekday of the window");
+            Assert.AreEqual("20260909", days[^1].ToString("yyyyMMdd"));
         }
 
         [Test]

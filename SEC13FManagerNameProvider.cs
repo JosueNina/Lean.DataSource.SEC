@@ -74,6 +74,7 @@ namespace QuantConnect.DataSource
             lock (_lock)
             {
                 _names = null;
+                _loaded = default;
                 _attempted = default;
             }
         }
