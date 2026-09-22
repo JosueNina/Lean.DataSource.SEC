@@ -37,12 +37,21 @@ jobs:
           path: Lean
 
       - name: Move Lean
-        run: mv Lean ../Lean
+        # The runners are self-hosted and ../Lean sits outside the checkout, so it survives
+        # between runs. Left in place, mv moves into it instead of renaming, and the step
+        # fails on whichever runner has already built this repo once.
+        run: |
+          rm -rf ../Lean
+          mv Lean ../Lean
 
       - name: Run build and tests
         run: |
           # BuildDataSource
           dotnet build ./QuantConnect.DataSource.csproj /p:Configuration=Release /v:quiet /p:WarningLevel=1
+          # BuildDataProcessing
+          # Built here too: without it a syntax error anywhere in the downloader lands on master
+          # with a green check, since nothing else in this workflow compiles that project.
+          dotnet build ./DataProcessing/DataProcessing.csproj /p:Configuration=Release /v:quiet /p:WarningLevel=1
           # BuildTests
           dotnet build ./tests/Tests.csproj /p:Configuration=Release /v:quiet /p:WarningLevel=1
           # Run Tests

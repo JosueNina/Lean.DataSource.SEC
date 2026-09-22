@@ -16,4 +16,9 @@
       <ProjectReference Include="..\QuantConnect.DataSource.csproj" />
     </ItemGroup>
 
+    <!-- config.json is deliberately not copied to the output directory. The deployed job writes its
+         own alongside the binary and every key here is read through a Config.Get default, while a
+         copy in the output flows down the ProjectReference chain into the test assembly, where it
+         would select the 13f dataset and repoint the process-wide data folder for the whole run. -->
+
 </Project>
