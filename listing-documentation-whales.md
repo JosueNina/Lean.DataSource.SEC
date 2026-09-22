@@ -8,7 +8,7 @@ can access the data later in your algorithm.
 class SEC13FDataAlgorithm(QCAlgorithm):
 
     def initialize(self) -> None:
-        # Coverage runs 2013-05-20 to 2026-05-29
+        # Coverage starts 2013-05-20
         self.set_start_date(2020, 10, 1)
         self.set_end_date(2020, 12, 31)
         self.set_cash(100000)
@@ -23,7 +23,7 @@ public class SEC13FDataAlgorithm : QCAlgorithm
 
     public override void Initialize()
     {
-        // Coverage runs 2013-05-20 to 2026-05-29
+        // Coverage starts 2013-05-20
         SetStartDate(2020, 10, 1);
         SetEndDate(2020, 12, 31);
         SetCash(100000);
@@ -142,10 +142,10 @@ var history = History<SEC13FHoldings>(_datasetSymbol, TimeSpan.FromDays(60), Res
 The three shapes differ more than usual for this dataset, because a point is a collection. Without
 `flatten`, Python gives you a **Series** and not a DataFrame, so reading a column off it will not
 work. With `flatten=True` you get one row per reported position, which is the form to use for
-anything cross-sectional: sixty days of AAPL history is one Series of 39 entries or a DataFrame of
-6,333 rows. A reported zero occasionally comes back there as `NaN` rather than as `0`, which is
-LEAN's pandas conversion rather than a gap in the data, so treat the two alike with
-`history_df["votingshared"].fillna(0)`.
+anything cross-sectional: sixty days of AAPL history read at the start of the fourth quarter of
+2020 is one Series of 36 entries or a DataFrame of 4,144 rows. A reported zero occasionally comes
+back there as `NaN` rather than as `0`, which is LEAN's pandas conversion rather than a gap in the
+data, so treat the two alike with `history_df["votingshared"].fillna(0)`.
 
 Ask for a time span rather than a bar count. A bar count is read in daily bars and the dataset
 publishes on filing dates only, so what comes back depends on how widely the security is held
