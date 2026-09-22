@@ -67,18 +67,19 @@ The following table describes the dataset properties:
 | Property | Value |
 | --- | --- |
 | Start Date | May 2013 |
-| Asset Coverage\* | 8,520 US Equities |
+| Asset Coverage\* | 18,877 US Equities |
 | Data Density | Sparse |
 | Resolution\*\* | Daily |
 | Timezone | America/New_York |
 
-\* Positions are reported by CUSIP, which is licensed and is not published, and resolve to a LEAN
-`Symbol` for 97.0 percent of the reported lines, so the dataset covers most reported positions
-rather than every reported name.
+\* The coverage includes all assets since the start date. It increases over time. Positions are
+reported by CUSIP, which is licensed and not published, and resolve to a LEAN `Symbol` for 97.0
+percent of the lines of one recent week and 95.0 percent of the fourth quarter of 2020; the
+crosswalk that reaches the hardest names begins in late 2019, so a security delisted before then
+is the likeliest to be missing.
 
 \*\* Positions are reported quarterly, but the managers of one quarter file across roughly fifty
-different days and several quarters are live at once, so publication is close to continuous. In the
-week of 3 to 7 August 2026, 1,462 filings produced 34,002 security days.
+different days and several quarters are live at once, so publication is close to continuous.
 
 ## Example Applications
 
@@ -108,7 +109,7 @@ Examples include the following strategies:
 | vendorName | Securities and Exchange Commission |
 | website | https://www.sec.gov |
 | history | May 2013 |
-| reach | 8,520 US Equities |
+| reach | 18,877 US Equities |
 | shortDescription | Ownership filings from the SEC as their holders filed them, starting with Form 13F institutional holdings |
 | priceCTA | Free in Cloud |
 | delivery | cloud only |
@@ -120,7 +121,7 @@ Licensing card:
 ```html
 <p>Free access to SEC Whales in QuantConnect Cloud for use in backtesting or live trading.</p>
 <ul>
-    <li>Every position reported on Form 13F since 2013, as each manager filed it, across 8,520 US Equities</li>
+    <li>Every position reported on Form 13F since 2013, as each manager filed it, across 18,877 US Equities</li>
     <li>Manager, reported quarter, share or principal amount, value, option side, discretion and voting authority per position</li>
     <li>Curated, clean data</li>
 </ul>

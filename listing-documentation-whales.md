@@ -115,9 +115,9 @@ var raw = holding.ReportedValue;      // as filed, with holding.ValueScale besid
 var shares = holding.Amount.GetValueOrDefault();
 ```
 
-An amendment, which `FormType` marks 13F-HR/A, is published beside the filing it corrects and
-replaces nothing, so a strategy that wants a restatement to supersede an earlier figure has to
-apply it. `ConfidentialOmitted` marks a submission that withheld other positions under confidential
+An amendment, which `FormType` marks 13F-HR/A, is published beside the filing it amends and
+replaces nothing. `AmendmentType` says which kind it is: `RESTATEMENT` replaces the original
+filing, `NEW HOLDINGS` only adds to it, and applying either is the algorithm's job. `ConfidentialOmitted` marks a submission that withheld other positions under confidential
 treatment, which makes that record a floor rather than the full picture.
 
 ## Historical Data
