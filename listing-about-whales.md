@@ -67,142 +67,18 @@ The following table describes the dataset properties:
 | Property | Value |
 | --- | --- |
 | Start Date | May 2013 |
-| Asset Coverage | 8,520 US Equities |
+| Asset Coverage\* | 8,520 US Equities |
 | Data Density | Sparse |
-| Resolution | Daily\* |
+| Resolution\*\* | Daily |
 | Timezone | America/New_York |
 
-\* Positions are reported quarterly, but the managers of one quarter file across roughly fifty
-different days and several quarters are live at once, so publication is close to continuous rather
-than quarterly. In the week of 3 to 7 August 2026, 1,462 filings carrying positions produced 34,002
-security days across 8,520 securities.
+\* Positions are reported by CUSIP, which is licensed and is not published, and resolve to a LEAN
+`Symbol` for 97.0 percent of the reported lines, so the dataset covers most reported positions
+rather than every reported name.
 
-The history begins on 2013-05-20, the first filing date in the SEC structured data set, whose first
-archive covers the second quarter of 2013. Anything earlier exists only as raw filings in the EDGAR
-full index and is not part of this dataset.
-
-Each record in a point carries the following fields, exactly as the manager filed them:
-
-| Property | Meaning |
-| --- | --- |
-| `AccessionNumber` | EDGAR accession number of the submission the line was reported on |
-| `ManagerCik` | Central Index Key of the filing manager, its stable identity across name changes |
-| `ManagerName` | The manager's name as its most recent cover page states it, without commas, null for an unknown CIK |
-| `PeriodEnd` | End of the quarter the position is reported for, the SEC PERIODOFREPORT |
-| `FormType` | 13F-HR for a holdings report, 13F-HR/A for an amendment |
-| `AmendmentType` | On an amendment, whether it restates the whole report or only adds holdings |
-| `AmendmentNumber` | Sequence number of the amendment, null on an original filing |
-| `TitleOfClass` | Class of the security as the manager titled it, such as COM or CL A |
-| `Amount` | Size of the position: a share count when `AmountType` is SH, a principal amount when PRN |
-| `AmountType` | SH for shares, PRN for a principal amount |
-| `ReportedValue` | Market value exactly as the manager stated it, in the unit the filing used |
-| `ValueScale` | The power of ten that turns `ReportedValue` into dollars: 3, 0 or -3 |
-| `MarketValue` | `ReportedValue` in whole dollars, derived from the two above and never stored |
-| `PutCall` | Call or Put when the line is an option on the security, null when it is the security |
-| `InvestmentDiscretion` | SOLE, DFND or OTR, as the filing states it |
-| `OtherManager` | The other managers sharing the position, as the cover page numbers them, separated by semicolons; empty when there are none |
-| `VotingSole` | Shares over which the manager holds sole voting authority |
-| `VotingShared` | Shares over which the manager shares voting authority |
-| `VotingNone` | Shares over which the manager holds no voting authority |
-| `ConfidentialOmitted` | True when the submission withheld other positions under confidential treatment |
-| `DateReported` | For a previously confidential filing, the date it was originally made |
-
-The CUSIP is not published, being licensed. It resolves the security and stops there.
-
-Option and debt lines are published as what they are rather than folded away. One quarter of the
-source carries 61,400 call lines, 57,443 put lines and 15,698 PRN lines, and a share count that
-swallowed any of them would misstate the position, so `AmountType` and `PutCall` say what each line
-is and the algorithm decides what to count.
-
-`ConfidentialOmitted` is a point-in-time feature rather than a data quality flag. A manager can ask
-the SEC to withhold specific positions temporarily, so a filing marked this way is incomplete by
-design and the withheld positions appear in a later filing.
-
-### The reported value is published as filed
-
-`ReportedValue` is the number the manager wrote. The SEC asked for thousands of dollars before 2023
-and whole dollars after, and filers on both sides of that change ignore the instruction: in Apple's
-December 2019 quarter 85 of 5,365 lines were already in dollars, and scaled as thousands they made
-88 percent of the total, an implied 2,577 dollars a share against a 293.65 close.
-
-`ValueScale` is the one reading in a record the SEC does not publish. It is the power of ten that
-turns the reported number into dollars, decided per line from the filing's period and from how the
-implied price compares with the security's close on the quarter's last trading day: 3 where the
-filing states thousands, 0 where it states dollars, and -3 for a line that overstated its value a
-thousandfold, which three SPY lines of the March 2023 quarter did, carrying 16 percent of that
-quarter's total with them.
-
-It is carried beside the reported number rather than multiplied into it, so what the manager filed
-stays readable and this one judgement stays separable from it. `MarketValue` applies it.
-
-### Amendments are published as filed
-
-An amendment is a record like any other, with its `FormType`, `AmendmentType` and `AmendmentNumber`
-saying what it is. It does not replace the filing it restates and nothing is netted against
-anything. Deciding that a restatement supersedes an earlier figure is a judgement about the data,
-and the filer has already declared which kind of amendment it made, so the algorithm can apply it.
-Most amendments restate the whole report, which is what `RESTATEMENT` in `AmendmentType` means;
-`NEW HOLDINGS` adds to the original.
-
-### A manager can change CIK
-
-A manager whose positions are reported on another manager's filing files a 13F-NT, a notice that
-carries no positions and contributes no records. Pershing Square Capital Management (CIK 1336528)
-reported its own positions through the March 2026 quarter and has filed a notice since, while
-Pershing Square Inc. (CIK 2026053) reports them. Followed by the first CIK alone, the fund appears
-to sell everything in one quarter, so follow every CIK the manager has reported under.
-
-### Coverage is partial by design
-
-Holdings are keyed by CUSIP in the source and resolved to a LEAN `Symbol` before publication, so no
-identifier from the source is shipped. The resolution runs in four steps, each picking up what the
-one before it could not reach:
-
-1. The CUSIP itself, looked up in LEAN's security database. The database repeats some identifiers
-   across the listings one company has had, such as the old and the new Alcoa, so every row carrying
-   the CUSIP is tried and the one trading under its own ticker on the filing date is kept.
-2. The US ISIN, built arithmetically from the same CUSIP. It reaches issuers whose CUSIP column in
-   that database is blank.
-3. The ticker the SEC's own Form N-PORT filings report for the CUSIP, taken back to a `Symbol`
-   through the map files. This step needs no security database at all and it is what reaches the
-   foreign domiciled issuers whose identifier is really a CINS, for which a constructed US ISIN is
-   wrong by construction. Alphabet is one of them.
-4. For an option line, the security the option is written on. A manager reporting options names them
-   by the option's own CUSIP, which carries the underlying's six character issuer and issue 90 for
-   calls or 95 for puts and appears in no security database. The position is still published as the
-   option line it is, with its side in `PutCall`; a line that names no side takes the one its CUSIP
-   states. Where the issuer has several funds, as iShares does, every fund's options share one CUSIP,
-   and each line goes to the one fund whose quarter-end close its implied price matches, or is dropped.
-
-A security's file holds what managers reported under its CUSIP, which is not always the common
-stock: filers put preferred shares, units and convertibles under the common's CUSIP, and
-`TitleOfClass` is the only field that says so. `ValueScale` takes the values 3, 0 and -3, so a
-filing stated in millions is not brought to dollars.
-
-A fund's reported ticker in step 3 is free text, so that step keeps a match only when the reported
-prices do not say otherwise. A group is dropped when three or more of its prices are not the
-security's own quarter-end close, in dollars or in thousands, which keeps Centerra Gold, Enerflex,
-B2Gold and DeFi Technologies, whose Toronto or fund-reported tickers are CG, EFX, BTO and DEFI, off
-Carlyle, Equifax, a John Hancock fund and the Hashdex DEFI ETF. A CUSIP whose issue number carries
-letters, as a company's debt does, is rejected outright when that issuer already has stock in the
-security database: Apple's 3.45% 2045 bond reached AAPL through a fund administrator's reported
-ticker and added the bond's principal amount to Apple's share count as ten thousand shares, and a
-bond near par against a stock near the same number agrees with a price test by coincidence. The
-iBonds ETFs, whose CUSIPs also carry letters, are themselves in the security database and resolve at
-step 1 without ever reaching that rule.
-
-Step 4 is only taken when the issuer has exactly one equity issue in the database. iShares writes
-seventy equity issues under 464287 and SPDR eleven under 81369Y, and an option CUSIP there names one
-of them without saying which; filing the position under the wrong fund would be worse than not
-publishing it. In the week of 3 to 7 August 2026 that step recovered 2,947 of the 6,083 lines
-reported on an option CUSIP and left the ambiguous rest out.
-
-The real limit is step 3's own history: N-PORT begins in late 2019, so a security that stopped
-trading before then is not reachable through it at any depth and can only be resolved if the first
-two steps already found it. Measured over the whole chain, 97.0 percent of the reported lines in the
-week of 3 to 7 August 2026 and 95.0 percent of those in the fourth quarter of 2020 resolved to a
-security and were published. The product therefore covers most of the reported positions but not
-every reported name, and it says so rather than implying full coverage.
+\*\* Positions are reported quarterly, but the managers of one quarter file across roughly fifty
+different days and several quarters are live at once, so publication is close to continuous. In the
+week of 3 to 7 August 2026, 1,462 filings produced 34,002 security days.
 
 ## Example Applications
 
@@ -229,7 +105,7 @@ Examples include the following strategies:
 | --- | --- |
 | name | SEC Whales |
 | url | sec-whales |
-| vendorName | U.S. Securities and Exchange Commission |
+| vendorName | Securities and Exchange Commission |
 | website | https://www.sec.gov |
 | history | May 2013 |
 | reach | 8,520 US Equities |
