@@ -129,44 +129,28 @@ dataset **Symbol**. If there is no data in the period you request, the history r
 # pandas Series, one entry per filing date, each holding the list of that day's positions
 history_series = self.history(self._dataset_symbol, timedelta(days=60), Resolution.DAILY)
 
-# DataFrame, one row per reported position
+# DataFrame, one row per reported position, columns named after the record's fields in lower case
 history_df = self.history(SEC13FHoldings, self._dataset_symbol, timedelta(days=60), Resolution.DAILY, flatten=True)
 
-# Dataset objects, one per filing date
+# SEC13FHoldings objects, one per filing date, each carrying its records
 history_bars = self.history[SEC13FHoldings](self._dataset_symbol, timedelta(days=60), Resolution.DAILY)
 ```
 ```csharp
 var history = History<SEC13FHoldings>(_datasetSymbol, TimeSpan.FromDays(60), Resolution.Daily);
 ```
 
-The three shapes differ more than usual for this dataset, because a point is a collection.
-
-Without `flatten`, Python gives you a **Series** and not a DataFrame: one entry per filing date,
-indexed by symbol and time, each entry holding the list of that day's positions. Reading a column
-off it will not work, because it has none.
-
-With `flatten=True` you get a DataFrame with **one row per reported position**, indexed by time and
-symbol, whose columns are the record's fields in lower case: `accessionnumber`, `managercik`,
-`managername`, `periodend`, `formtype`, `amendmenttype`, `amendmentnumber`, `titleofclass`,
-`amount`, `amounttype`, `reportedvalue`, `valuescale`, `marketvalue`, `putcall`, `investmentdiscretion`, `othermanager`,
-`votingsole`, `votingshared`, `votingnone`, `confidentialomitted`, `datereported`. This is the form
-to use for anything cross-sectional. Sixty days of AAPL history is one Series of 39 entries or a
-DataFrame of 6,333 rows, which is the difference the flag makes.
-
-Note that a reported zero occasionally comes back as `NaN` in the flattened frame rather than as
-`0`, which is LEAN's pandas conversion rather than a gap in the data. Treat the two alike:
-
-```python
-shares = history_df["votingshared"].fillna(0)
-```
-
-The typed history and the C# history give you the `SEC13FHoldings` objects themselves, one per
-filing date, each carrying its records. That is the form that keeps the day's positions grouped.
+The three shapes differ more than usual for this dataset, because a point is a collection. Without
+`flatten`, Python gives you a **Series** and not a DataFrame, so reading a column off it will not
+work. With `flatten=True` you get one row per reported position, which is the form to use for
+anything cross-sectional: sixty days of AAPL history is one Series of 39 entries or a DataFrame of
+6,333 rows. A reported zero occasionally comes back there as `NaN` rather than as `0`, which is
+LEAN's pandas conversion rather than a gap in the data, so treat the two alike with
+`history_df["votingshared"].fillna(0)`.
 
 Ask for a time span rather than a bar count. A bar count is read in daily bars and the dataset
-publishes on filing dates only, so what comes back depends on how widely the security is held rather
-than on the count you asked for. AAPL carries filings on 58 of the 66 weekdays of the fourth quarter
-of 2020, while a thinly held name carries them on a handful of days a year.
+publishes on filing dates only, so what comes back depends on how widely the security is held
+rather than on the count you asked for. AAPL carries filings on 58 of the 66 weekdays of the fourth
+quarter of 2020, while a thinly held name carries them on a handful of days a year.
 
 For more information about historical data, see [History Requests](https://www.quantconnect.com/docs/v2/writing-algorithms/historical-data/history-requests).
 
