@@ -37,8 +37,8 @@ namespace QuantConnect.DataProcessing
     ///
     /// The ticker is free text written by fund administrators ("GOOGL", "GOOGL US", "goog"), so it
     /// is normalised and voted on across every fund that reported the security. Each entry keeps the
-    /// day its data set begins, because a ticker only names a security on a date: META named a
-    /// Roundhill ETF from June 2021 to January 2022, before Facebook took it.
+    /// latest day a fund reported holding it under that ticker, because a ticker only names a security
+    /// on a date: META named a Roundhill ETF from June 2021 to January 2022, before Facebook took it.
     ///
     /// N-PORT begins in late 2019, so a security that stopped trading before then never appears
     /// here and still depends on the security database.
@@ -48,8 +48,11 @@ namespace QuantConnect.DataProcessing
         private const string NPortUrlFormat =
             "https://www.sec.gov/files/dera/data/form-n-port-data-sets/{0}q{1}_nport.zip";
 
+        private const string SubmissionTable = "SUBMISSION.tsv";
         private const string HoldingTable = "FUND_REPORTED_HOLDING.tsv";
         private const string IdentifierTable = "IDENTIFIERS.tsv";
+
+        private static readonly string[] ReportDateFormats = { "dd-MMM-yyyy", "d-MMM-yyyy", "yyyy-MM-dd" };
 
         /// <summary>
         /// The file the built map is cached in, so the next run does not re-download gigabytes. Not
@@ -57,7 +60,7 @@ namespace QuantConnect.DataProcessing
         /// </summary>
         public const string CacheFileName = "nport-crosswalk.txt";
 
-        /// <summary>The ticker the funds reported for a CUSIP, and the first day of the data set it came from.</summary>
+        /// <summary>The ticker the funds reported for a CUSIP, and the latest day they reported holding it under it.</summary>
         public readonly record struct Entry(string Ticker, DateTime Observed);
 
         /// <summary>
@@ -100,7 +103,7 @@ namespace QuantConnect.DataProcessing
                 var path = download(Url(year, quarter), $"{QuarterKey((year, quarter))}_nport.zip");
                 downloads.Add(path);
 
-                Fold(cached, QuarterStart(year, quarter), BuildFromQuarter(path, year, quarter));
+                Fold(cached, BuildFromQuarter(path, year, quarter));
                 cachedQuarters.Add(QuarterKey((year, quarter)));
             }
 
@@ -122,14 +125,13 @@ namespace QuantConnect.DataProcessing
         /// order the data sets arrive in: a first build walks back from today, while a refresh adds
         /// one newer quarter on top of the cache.
         /// </summary>
-        internal static void Fold(Dictionary<string, Entry> map, DateTime observed,
-            IEnumerable<KeyValuePair<string, string>> tickers)
+        internal static void Fold(Dictionary<string, Entry> map, IEnumerable<KeyValuePair<string, Entry>> entries)
         {
-            foreach (var (cusip, ticker) in tickers)
+            foreach (var (cusip, entry) in entries)
             {
-                if (!map.TryGetValue(cusip, out var held) || held.Observed <= observed)
+                if (!map.TryGetValue(cusip, out var held) || held.Observed <= entry.Observed)
                 {
-                    map[cusip] = new Entry(ticker, observed);
+                    map[cusip] = entry;
                 }
             }
         }
@@ -166,10 +168,30 @@ namespace QuantConnect.DataProcessing
         /// HOLDING_ID and neither is sorted: the first collects the identifier rows that carry a
         /// ticker, only 6.9 percent of them, and the second votes those tickers onto the CUSIP each
         /// holding belongs to.
+        ///
+        /// A CUSIP is observed on the latest REPORT_DATE among the reports that voted for its ticker,
+        /// the day a fund held it under that name. The data set's quarter is when the reports were
+        /// filed, which comes after: Janus Henderson, delisted on 30 June 2026, reached the 2026Q3 data
+        /// set as JHG, and observed on 1 July its ticker named nothing, so its CUSIP stopped resolving
+        /// for every filing back to 2017.
         /// </summary>
-        private static IEnumerable<KeyValuePair<string, string>> BuildFromQuarter(string path, int year, int quarter)
+        internal static IEnumerable<KeyValuePair<string, Entry>> BuildFromQuarter(string path, int year, int quarter)
         {
             using var archive = ZipFile.OpenRead(path);
+
+            var reportDates = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+            foreach (var fields in ReadTable(archive, SubmissionTable, "ACCESSION_NUMBER", "REPORT_DATE"))
+            {
+                if (DateTime.TryParseExact(fields[1].Trim(), ReportDateFormats, CultureInfo.InvariantCulture,
+                        DateTimeStyles.None, out var reportDate))
+                {
+                    reportDates[fields[0]] = reportDate;
+                }
+            }
+
+            // A report without a usable date counts from the first day of its data set, the latest
+            // day it can describe.
+            var quarterStart = QuarterStart(year, quarter);
 
             var tickersByHolding = new Dictionary<string, string>(StringComparer.Ordinal);
             foreach (var fields in ReadTable(archive, IdentifierTable, "HOLDING_ID", "IDENTIFIER_TICKER"))
@@ -181,15 +203,15 @@ namespace QuantConnect.DataProcessing
                 }
             }
 
-            var votes = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
-            foreach (var fields in ReadTable(archive, HoldingTable, "HOLDING_ID", "ISSUER_CUSIP"))
+            var votes = new Dictionary<string, Dictionary<string, (int Count, DateTime Latest)>>(StringComparer.Ordinal);
+            foreach (var fields in ReadTable(archive, HoldingTable, "ACCESSION_NUMBER", "HOLDING_ID", "ISSUER_CUSIP"))
             {
-                if (!tickersByHolding.TryGetValue(fields[0], out var ticker))
+                if (!tickersByHolding.TryGetValue(fields[1], out var ticker))
                 {
                     continue;
                 }
 
-                var cusip = fields[1].Trim().ToUpperInvariant();
+                var cusip = fields[2].Trim().ToUpperInvariant();
 
                 // Foreign issuers without a CUSIP are masked as all zeros in this data set.
                 if (cusip.Length != 9 || cusip == "000000000")
@@ -199,19 +221,23 @@ namespace QuantConnect.DataProcessing
 
                 if (!votes.TryGetValue(cusip, out var tally))
                 {
-                    votes[cusip] = tally = new Dictionary<string, int>(StringComparer.Ordinal);
+                    votes[cusip] = tally = new Dictionary<string, (int, DateTime)>(StringComparer.Ordinal);
                 }
 
-                tally.TryGetValue(ticker, out var count);
-                tally[ticker] = count + 1;
+                var reported = reportDates.TryGetValue(fields[0], out var reportDate) ? reportDate : quarterStart;
+                tally.TryGetValue(ticker, out var held);
+                tally[ticker] = (held.Count + 1, reported > held.Latest ? reported : held.Latest);
             }
 
             Log.Trace($"SEC13FTickerCrosswalk.BuildFromQuarter(): {year}Q{quarter}: " +
                       $"{tickersByHolding.Count} holdings carried a ticker, {votes.Count} CUSIPs resolved");
 
-            return votes.Select(pair => new KeyValuePair<string, string>(
-                pair.Key,
-                pair.Value.OrderByDescending(vote => vote.Value).ThenBy(vote => vote.Key, StringComparer.Ordinal).First().Key))
+            return votes.Select(pair =>
+                {
+                    var winner = pair.Value.OrderByDescending(vote => vote.Value.Count)
+                        .ThenBy(vote => vote.Key, StringComparer.Ordinal).First();
+                    return new KeyValuePair<string, Entry>(pair.Key, new Entry(winner.Key, winner.Value.Latest));
+                })
                 .ToList();
         }
 
@@ -238,11 +264,7 @@ namespace QuantConnect.DataProcessing
         private static string QuarterKey((int Year, int Quarter) quarter)
             => $"{quarter.Year}q{quarter.Quarter}";
 
-        /// <summary>
-        /// The day a data set's tickers are taken to be observed on: its quarter's first day. A ticker
-        /// renamed within that quarter fails the traded-under check in the downloader, so its CUSIP
-        /// stays unresolved until a newer quarter is folded in. Rare, and it never resolves wrongly.
-        /// </summary>
+        /// <summary>The first day of a data set's quarter.</summary>
         private static DateTime QuarterStart(int year, int quarter)
             => new(year, quarter * 3 - 2, 1);
 

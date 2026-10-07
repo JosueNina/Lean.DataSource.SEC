@@ -953,19 +953,65 @@ namespace QuantConnect.DataLibrary.Tests
         {
             // The quarters used to be folded newest first, so a first build kept the oldest ticker
             // of a renamed security while a refresh kept the newest.
-            var older = new[] { KeyValuePair.Create("30303M102", "FB") };
-            var newer = new[] { KeyValuePair.Create("30303M102", "META") };
+            var older = new[] { KeyValuePair.Create("30303M102", new SEC13FTickerCrosswalk.Entry("FB", new DateTime(2022, 3, 31))) };
+            var newer = new[] { KeyValuePair.Create("30303M102", new SEC13FTickerCrosswalk.Entry("META", new DateTime(2022, 6, 30))) };
 
             var olderFirst = new Dictionary<string, SEC13FTickerCrosswalk.Entry>();
-            SEC13FTickerCrosswalk.Fold(olderFirst, new DateTime(2022, 4, 1), older);
-            SEC13FTickerCrosswalk.Fold(olderFirst, new DateTime(2022, 7, 1), newer);
+            SEC13FTickerCrosswalk.Fold(olderFirst, older);
+            SEC13FTickerCrosswalk.Fold(olderFirst, newer);
 
             var newerFirst = new Dictionary<string, SEC13FTickerCrosswalk.Entry>();
-            SEC13FTickerCrosswalk.Fold(newerFirst, new DateTime(2022, 7, 1), newer);
-            SEC13FTickerCrosswalk.Fold(newerFirst, new DateTime(2022, 4, 1), older);
+            SEC13FTickerCrosswalk.Fold(newerFirst, newer);
+            SEC13FTickerCrosswalk.Fold(newerFirst, older);
 
             Assert.AreEqual("META", olderFirst["30303M102"].Ticker);
             Assert.AreEqual("META", newerFirst["30303M102"].Ticker);
+        }
+
+        [Test]
+        public void ACrosswalkCusipIsObservedOnTheLatestReportDateOfItsWinningTicker()
+        {
+            // The 2026Q3 data set holds reports filed from July to September, describing holdings as
+            // of earlier dates. Each CUSIP takes the latest REPORT_DATE among the reports that voted
+            // for the ticker it keeps, not the data set's first day.
+            var path = WriteNPortArchive(
+                new[] { ("A-1", "31-MAY-2026"), ("A-2", "30-JUN-2026"), ("A-3", "31-JUL-2026"), ("A-4", "") },
+                new[]
+                {
+                    ("A-1", "1", "G4474Y214", "JHG"),
+                    ("A-2", "2", "G4474Y214", "JHG US"),
+                    ("A-3", "3", "G4474Y214", "JHGX"),
+                    ("A-4", "4", "037833100", "AAPL")
+                });
+
+            var entries = SEC13FTickerCrosswalk.BuildFromQuarter(path, 2026, 3)
+                .ToDictionary(pair => pair.Key, pair => pair.Value);
+
+            Assert.AreEqual(new SEC13FTickerCrosswalk.Entry("JHG", new DateTime(2026, 6, 30)), entries["G4474Y214"],
+                "the July report voted for another ticker, so it does not move the date");
+            Assert.AreEqual(new SEC13FTickerCrosswalk.Entry("AAPL", new DateTime(2026, 7, 1)), entries["037833100"],
+                "a report without a date counts from the data set's first day");
+        }
+
+        [Test]
+        public void ACrosswalkTickerDelistedBeforeItsDataSetBeganStillResolvesOnItsReportDate()
+        {
+            // Janus Henderson was delisted on 30 June 2026 and reached the 2026Q3 data set as JHG.
+            // Observed on the data set's first day the ticker named nothing, and the CUSIP stopped
+            // resolving for every 13F since 2017. On the day the funds reported holding it, it does.
+            SeedMapFileRows(("jhg", new[] { "20170530,jhg", "20260630,jhg" }));
+
+            var path = WriteNPortArchive(new[] { ("A-1", "30-JUN-2026") }, new[] { ("A-1", "1", "G4474Y214", "JHG") });
+            var crosswalk = SEC13FTickerCrosswalk.BuildFromQuarter(path, 2026, 3)
+                .ToDictionary(pair => pair.Key, pair => pair.Value);
+
+            using var downloader = Downloader();
+            downloader.TickerCrosswalk = crosswalk;
+
+            var security = downloader.ResolveThroughTicker("G4474Y214");
+
+            Assert.IsNotNull(security);
+            Assert.AreEqual("JHG", downloader.ResolveTicker(security, new DateTime(2018, 2, 14))?.ToUpperInvariant());
         }
 
         // ---- Crosswalk resolutions are held against the close --------------------------------------
@@ -2083,6 +2129,33 @@ namespace QuantConnect.DataLibrary.Tests
         }
 
         /// <summary>A downloader writing into this test's own temporary directories.</summary>
+        /// <summary>A minimal N-PORT data set: report dates by accession, and holdings with the ticker each carried.</summary>
+        private string WriteNPortArchive((string Accession, string ReportDate)[] submissions,
+            (string Accession, string HoldingId, string Cusip, string Ticker)[] holdings)
+        {
+            var path = Path.Combine(_root, $"nport-{Guid.NewGuid():N}.zip");
+            Directory.CreateDirectory(_root);
+            using var zip = ZipFile.Open(path, ZipArchiveMode.Create);
+
+            void Table(string name, string header, IEnumerable<string> rows)
+            {
+                using var writer = new StreamWriter(zip.CreateEntry(name).Open());
+                writer.WriteLine(header);
+                foreach (var row in rows)
+                {
+                    writer.WriteLine(row);
+                }
+            }
+
+            Table("SUBMISSION.tsv", "ACCESSION_NUMBER\tFILING_DATE\tREPORT_DATE",
+                submissions.Select(x => $"{x.Accession}\t01-AUG-2026\t{x.ReportDate}"));
+            Table("FUND_REPORTED_HOLDING.tsv", "ACCESSION_NUMBER\tHOLDING_ID\tISSUER_CUSIP",
+                holdings.Select(x => $"{x.Accession}\t{x.HoldingId}\t{x.Cusip}"));
+            Table("IDENTIFIERS.tsv", "HOLDING_ID\tIDENTIFIER_TICKER",
+                holdings.Select(x => $"{x.HoldingId}\t{x.Ticker}"));
+            return path;
+        }
+
         private SEC13FDownloader Downloader()
         {
             return new SEC13FDownloader(Path.Combine(_root, "out"), Path.Combine(_root, "processed"), null);
